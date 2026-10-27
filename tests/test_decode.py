@@ -443,11 +443,17 @@ class TestNewFirmware(unittest.TestCase):
         )
 
     def test_anomalous_eeg4_packet(self):
-        """Test that anomalous 0x11 (EEG4) packets are handled correctly."""
+        """Anomalous new-firmware capture yields EEG8 only, with no phantom EEG4.
+
+        This capture carries no 0x11 (EEG4) at any valid packet boundary. The
+        pre-0x88-framing-fix parser read the status packet as 188 bytes, swallowed
+        the trailing subpackets, and fabricated a single phantom 0x11 EEG4 record.
+        The fixed framing (PR #32) consumes 20 status bytes and preserves the real
+        subpackets, so only genuine 0x12 (EEG8) records remain.
+        """
         with open(self.anomalous_file, "r", encoding="utf-8") as f:
             messages = [line.strip() for line in f if line.strip()]
 
-        # Check that we can find 0x11 packets in the raw data
         found_eeg4 = False
         found_eeg8 = False
         for message in messages:
@@ -456,7 +462,6 @@ class TestNewFirmware(unittest.TestCase):
                 tag = subpacket.get("tag_byte")
                 if tag == 0x11:
                     found_eeg4 = True
-                    # Verify 0x11 has 4 channels
                     self.assertEqual(
                         subpacket["n_channels"], 4, "0x11 packet should have 4 channels"
                     )
@@ -467,7 +472,9 @@ class TestNewFirmware(unittest.TestCase):
                         subpacket["n_channels"], 8, "0x12 packet should have 8 channels"
                     )
 
-        self.assertTrue(found_eeg4, "Should find at least one 0x11 (EEG4) packet")
+        self.assertFalse(
+            found_eeg4, "Fixed framing must not fabricate a phantom 0x11 (EEG4) packet"
+        )
         self.assertTrue(found_eeg8, "Should find at least one 0x12 (EEG8) packet")
 
     def test_anomalous_packet_data_validity(self):
