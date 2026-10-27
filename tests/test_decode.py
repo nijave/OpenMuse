@@ -15,8 +15,10 @@ from OpenMuse.decode import (
     parse_message,
     decode_rawdata,
     SENSORS,
+    BATTERY_CHANNELS,
     make_timestamps,
     select_optics_channels,
+    _decode_battery_data,
     _decode_drlref_data,
     _parse_packets,
     EEG_SCALE,
@@ -371,6 +373,114 @@ class TestBattery(unittest.TestCase):
                 delta=0.5,
                 msg=f"Battery level mismatch for {key}: got {float(battery_percent):.2f}, expected {expected:.2f}",
             )
+
+
+    def test_battery_status_worked_example(self):
+        """Decode the 10 fields of a real 0x88 status body (firmware 3.1.29)."""
+        body = bytes.fromhex("d663c800c900d606ffffe00142722cce16ffe019")
+        self.assertEqual(len(body), 20)
+
+        decoded = _decode_battery_data(body, 0x88)
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.shape, (1, 10))
+
+        expected = [
+            99.8359375,  # BATTERY_PERCENT: 25558 / 256
+            200.0,  # REMAINING_CAPACITY
+            201.0,  # FULL_CAPACITY
+            1750.0,  # TIME_TO_EMPTY_INST_RAW
+            np.nan,  # TIME_TO_FULL_S: 0xFFFF sentinel
+            4.80,  # CYCLES: 480 * 0.01
+            29250.0,  # BATTERY_AGE_RAW
+            4123.4375,  # VOLTAGE_MV: 52780 * 0.078125
+            -36.5625,  # CURRENT_MA: int16 -234 * 0.15625
+            37260.0,  # TIME_TO_EMPTY_S: 6624 * 5.625
+        ]
+        np.testing.assert_allclose(decoded[0], expected, rtol=1e-6)
+        self.assertTrue(np.isnan(decoded[0][4]))
+
+    def test_battery_time_to_full_sentinel_is_conditional(self):
+        """0xFFFF → NaN, but any other raw value scales normally."""
+        body = bytearray(20)
+        body[8:10] = (0x34, 0x12)  # idx 4 = 0x1234
+        decoded = _decode_battery_data(bytes(body), 0x88)
+        self.assertIsNotNone(decoded)
+        self.assertFalse(np.isnan(decoded[0][4]))
+        np.testing.assert_allclose(
+            decoded[0][4], 0x1234 * 5.625, rtol=1e-6
+        )
+
+    def test_battery_short_body_returns_none(self):
+        self.assertIsNone(_decode_battery_data(bytes(19), 0x88))
+        self.assertIsNone(_decode_battery_data(bytes(19), 0x98))
+
+    def test_legacy_battery_0x98_same_layout(self):
+        """0x98 (data_p1041 era) uses the same 10-field layout as 0x88."""
+        # Real 0x98 body from tests/test_data/data_p1041.txt: 80.22 %,
+        # 140 remaining / 175 full capacity, not-charging sentinel, 1.34
+        # cycles, 3885.5 mV, -55.6 mA discharge, ~12.2 h to empty.
+        body = bytes.fromhex("39508c00af006602ffff8600427247c29cfe761e")
+        decoded = _decode_battery_data(body, 0x98)
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.shape, (1, 10))
+        expected = [
+            80.22265625,  # 20537 / 256
+            140.0,
+            175.0,
+            614.0,
+            np.nan,  # 0xFFFF sentinel
+            1.34,  # 134 * 0.01
+            29250.0,
+            3885.546875,  # 49735 * 0.078125
+            -55.625,  # int16 -356 * 0.15625
+            43863.75,  # 7798 * 5.625
+        ]
+        np.testing.assert_allclose(decoded[0], expected, rtol=1e-6)
+
+    def test_battery_p1041_integration(self):
+        """Integration: 0x88 status fields over the data_p1041 discharge capture."""
+        filepath = os.path.join(self.test_data_dir, "data_p1041.txt")
+        with open(filepath, "r", encoding="utf-8") as f:
+            messages = [line.strip() for line in f if line.strip()]
+
+        result = decode_rawdata(messages)
+        battery_df = result["BATTERY"]
+
+        self.assertGreater(len(battery_df), 0, "No battery data in data_p1041.txt")
+        self.assertEqual(
+            len(battery_df.columns),
+            11,
+            f"BATTERY should have 11 columns (time + 10), got {list(battery_df.columns)}",
+        )
+        self.assertEqual(
+            list(battery_df.columns),
+            ["time", *(c.lower() for c in BATTERY_CHANNELS)],
+        )
+
+        battery_percent = battery_df["battery_percent"]
+        self.assertTrue(
+            ((battery_percent >= 0) & (battery_percent <= 100)).all(),
+            f"battery_percent out of [0, 100]: {battery_percent.min()}..{battery_percent.max()}",
+        )
+
+        voltage = battery_df["voltage_mv"]
+        self.assertTrue(
+            ((voltage >= 3000) & (voltage <= 4300)).all(),
+            f"voltage_mv out of [3000, 4300]: {voltage.min()}..{voltage.max()}",
+        )
+
+        current = battery_df["current_ma"]
+        self.assertTrue(
+            (current < 0).all(),
+            f"current_ma must be strictly negative (discharging), got {current.min()}..{current.max()}",
+        )
+
+        full_capacity = battery_df["full_capacity"]
+        self.assertEqual(
+            full_capacity.nunique(),
+            1,
+            f"full_capacity should be constant, got {full_capacity.unique()}",
+        )
 
 
 class TestNewFirmware(unittest.TestCase):

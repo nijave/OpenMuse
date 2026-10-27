@@ -110,7 +110,7 @@ Five LSL streams are created:
 - Muse_EEG: 8 channels at 256 Hz (EEG + AUX)
 - Muse_ACCGYRO: 6 channels at 52 Hz (accelerometer + gyroscope)
 - Muse_OPTICS: 16 channels at 64 Hz (PPG sensors)
-- Muse_BATTERY: 1 channel at 1 Hz (battery percentage)
+- Muse_BATTERY: 10 channels at 1 Hz (battery/status fields)
 - Muse_DRL: 2 channels at 32 Hz (DRL/REF electrode pair)
 
 Each stream includes:
