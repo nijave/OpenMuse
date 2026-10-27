@@ -28,3 +28,9 @@ OpenMuse = "OpenMuse.cli:main"
 
 [tool.setuptools]
 packages = ["OpenMuse"]
+
+[tool.pytest.ini_options]
+# Only tests/ holds the test suite. validation/ and old/ contain standalone
+# test_*.py scripts that call sys.exit() at import time and crash collection
+# when pytest is run from the repository root.
+testpaths = ["tests"]
