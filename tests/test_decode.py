@@ -7,6 +7,9 @@ The new decoder returns numpy arrays with timestamps instead of lists of dicts.
 
 import unittest
 import os
+import glob
+from datetime import datetime
+
 import numpy as np
 from OpenMuse.decode import (
     parse_message,
@@ -15,6 +18,7 @@ from OpenMuse.decode import (
     make_timestamps,
     select_optics_channels,
     _decode_drlref_data,
+    _parse_packets,
     EEG_SCALE,
 )
 
@@ -571,6 +575,80 @@ class TestDRLRef(unittest.TestCase):
                 seen_records.add((subpacket["n_channels"], subpacket["n_samples"]))
 
         self.assertEqual(seen_records, {(2, 6)})
+
+
+class TestNoUnknownPacketTags(unittest.TestCase):
+    """Guard: no capture fixture may carry a packet tag missing from SENSORS.
+
+    _parse_packets silently drops packets whose pkt_id is not in SENSORS
+    (pkt_type=None, pkt_valid=False). If a future firmware adds a sensor tag,
+    that data would be lost with no error. This test walks every
+    tests/test_data/data_*.txt fixture and fails loudly if any packet tag is
+    unknown, so adding a tag means updating SENSORS.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Locate test fixtures."""
+        cls.test_data_dir = os.path.join(os.path.dirname(__file__), "test_data")
+
+    def test_no_fixture_carries_unknown_packet_tag(self):
+        """Every packet tag in every data_*.txt fixture must be in SENSORS."""
+        fixture_files = sorted(
+            glob.glob(os.path.join(self.test_data_dir, "data_*.txt"))
+        )
+        self.assertGreater(
+            len(fixture_files),
+            0,
+            "Expected at least one data_*.txt fixture in tests/test_data",
+        )
+
+        all_tags = set()
+
+        for fixture in fixture_files:
+            name = os.path.basename(fixture)
+            with self.subTest(fixture=name):
+                with open(fixture, "r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+
+                unknown_tags = set()
+                for line in lines:
+                    # Mirror parse_message: skip malformed lines silently.
+                    try:
+                        ts, uuid, hexstring = line.split("\t", 2)
+                        message_time = datetime.fromisoformat(
+                            ts.replace("Z", "+00:00")
+                        )
+                        payload = bytes.fromhex(hexstring.strip())
+                    except (ValueError, AttributeError):
+                        continue
+
+                    for pkt in _parse_packets(payload, message_time, uuid):
+                        tag = pkt["pkt_id"]
+                        all_tags.add(tag)
+                        if pkt["pkt_type"] is None:
+                            unknown_tags.add(tag)
+
+                self.assertEqual(
+                    unknown_tags,
+                    set(),
+                    f"{name}: unknown packet tag(s) "
+                    + ", ".join(f"0x{tag:02x}" for tag in sorted(unknown_tags))
+                    + " not in decode.SENSORS — add the tag or recapture the fixture",
+                )
+
+        # Sanity check the same property stated the other way: the walk must
+        # have seen real tags, all of which belong to SENSORS.
+        self.assertTrue(
+            all_tags.issubset(set(SENSORS)),
+            "Tags seen across fixtures missing from SENSORS: "
+            + ", ".join(f"0x{tag:02x}" for tag in sorted(all_tags - set(SENSORS))),
+        )
+        self.assertGreater(
+            len(all_tags),
+            0,
+            "No packet tags were seen across fixtures; the walk parsed nothing",
+        )
 
 
 if __name__ == "__main__":
