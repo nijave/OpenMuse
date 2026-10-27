@@ -631,7 +631,12 @@ def _decode_battery_data(data_bytes: bytes, tag_byte: int) -> Optional[np.ndarra
 
     raw = np.frombuffer(data_bytes[:20], dtype="<u2", count=10)
     data = np.empty(10, dtype=np.float32)
-    data[0] = raw[0] / 256.0
+    # A percentage outside 0-100 means the body is not a status record (a
+    # mis-framed subpacket, or junk after a short read). Report NaN rather
+    # than a plausible-looking wrong number; the other fields are left as
+    # decoded so a caller can still inspect them.
+    percent = raw[0] / 256.0
+    data[0] = percent if 0.0 <= percent <= 100.0 else np.nan
     data[1] = raw[1] * (5.0 / 7.0)
     data[2] = raw[2] * (5.0 / 7.0)
     data[3] = raw[3] * 5.625
