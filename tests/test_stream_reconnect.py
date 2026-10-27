@@ -91,9 +91,11 @@ class ReconnectWrapperTests(unittest.TestCase):
         return clock, fake
 
     def test_no_flag_single_call_no_retry(self):
+        # Default path keeps the pre-reconnect behaviour: a lost link ends the
+        # stream quietly (warning printed inside _stream_async), no retry, no
+        # exception surfaced to the caller.
         _, fake = self._make(["disconnected"])
-        with self.assertRaises(StreamDisconnected):
-            run_wrapper(fake, auto_reconnect=False)
+        run_wrapper(fake, auto_reconnect=False)
         self.assertEqual(len(fake.calls), 1)
 
     def test_recovers_after_transient_disconnects(self):
