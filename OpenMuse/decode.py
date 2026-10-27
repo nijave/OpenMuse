@@ -99,11 +99,14 @@ SENSORS = {
         "rate": 52.0,
         "data_len": 36,
     },
+    # DRL/REF electrode pair (driven-right-leg + reference). 6 samples x 2
+    # channels, int16 LE interleaved [DRL, REF, ...]. Validated on firmware
+    # 3.1.29 (live headband) and corroborated by a third-party decoder on 3.1.23.
     0x53: {
-        "type": "Unknown",
-        "n_channels": 0,
-        "n_samples": 0,
-        "rate": 0.0,
+        "type": "DRL",
+        "n_channels": 2,
+        "n_samples": 6,
+        "rate": 32.0,
         "data_len": 24,
     },
     # New firmware battery/status data is 20 bytes, like 0x98. Longer BLE
@@ -173,6 +176,10 @@ OPTICS_CHANNELS = (
 )
 
 BATTERY_CHANNELS = ("BATTERY_PERCENT",)
+
+# DRL/REF electrode pair: channel 0 = DRL (driven electrode, pinned near the
+# 14-bit ADC mid-rail), channel 1 = REF (reference, varies with contact).
+DRL_CHANNELS = ("DRL", "REF")
 
 
 def select_eeg_channels(count: int) -> List[str]:
@@ -264,6 +271,7 @@ def _empty_result() -> Dict[str, List]:
         "ACCGYRO": [],
         "OPTICS": [],
         "BATTERY": [],
+        "DRL": [],
         "Unknown": [],
     }
 
@@ -275,6 +283,7 @@ def _empty_result_arrays() -> Dict[str, np.ndarray]:
         "ACCGYRO": np.empty((0, 0)),
         "OPTICS": np.empty((0, 0)),
         "BATTERY": np.empty((0, 0)),
+        "DRL": np.empty((0, 0)),
         "Unknown": np.empty((0, 0)),
     }
 
@@ -475,6 +484,8 @@ def _decode_subpacket_data(subpkt: Dict) -> Optional[Dict]:
         data = _decode_accgyro_data(data_bytes)
     elif sensor_type == "BATTERY":
         data = _decode_battery_data(data_bytes)
+    elif sensor_type == "DRL":
+        data = _decode_drlref_data(data_bytes)
     elif sensor_type == "EEG":
         data = _decode_eeg_data(data_bytes, n_channels)
     elif sensor_type == "OPTICS":
@@ -512,6 +523,30 @@ def _decode_accgyro_data(data_bytes: bytes) -> Optional[np.ndarray]:
     # Apply scaling
     data[:, 0:3] *= ACC_SCALE  # Accelerometer
     data[:, 3:6] *= GYRO_SCALE  # Gyroscope
+
+    return data
+
+
+def _decode_drlref_data(data_bytes: bytes) -> Optional[np.ndarray]:
+    """
+    Decode DRL/REF data (24 bytes → 6 samples × 2 channels, TAG 0x53).
+
+    Channel 0 = DRL (driven electrode), channel 1 = REF (reference). The µV
+    scale below is provisional: these electrodes share the EEG analog
+    front-end, pending further calibration.
+
+    Returns: np.ndarray shape (6, 2) with columns [DRL, REF]
+    """
+    if len(data_bytes) < 24:
+        return None
+
+    # Parse 12 int16 values, reshape to 6 samples × 2 channels (interleaved
+    # [DRL, REF, DRL, REF, ...])
+    data = np.frombuffer(data_bytes[:24], dtype="<i2", count=12).reshape(6, 2)
+    data = data.astype(np.float32)
+
+    # Apply the EEG µV scale (provisional, shared analog front-end)
+    data *= EEG_SCALE
 
     return data
 
@@ -915,7 +950,7 @@ def decode_rawdata(messages: List[str]) -> Dict[str, pd.DataFrame]:
 
     # Collect all subpackets from all messages
     all_subpackets = {
-        key: [] for key in ["EEG", "ACCGYRO", "OPTICS", "BATTERY", "Unknown"]
+        key: [] for key in ["EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL", "Unknown"]
     }
 
     for message in messages:
@@ -951,6 +986,8 @@ def decode_rawdata(messages: List[str]) -> Dict[str, pd.DataFrame]:
             columns = ["time", *select_optics_channels(n_channels)]
         elif sensor_type == "BATTERY":
             columns = ["time", "battery_percent"]
+        elif sensor_type == "DRL":
+            columns = ["time", *DRL_CHANNELS]
         else:
             # Generic column names
             columns = ["time"] + [f"ch_{i+1}" for i in range(n_cols - 1)]

@@ -129,7 +129,7 @@ def main(argv=None):
         "--sensors",
         nargs="+",
         default=None,
-        choices=["EEG", "ACCGYRO", "OPTICS", "BATTERY"],
+        choices=["EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL"],
         help="Sensor types to stream (default: all). Example: --sensors EEG OPTICS",
     )
 
