@@ -106,11 +106,12 @@ When loading XDF files with pyxdf:
 
 LSL Stream Configuration:
 -------------------------
-Four LSL streams are created:
+Five LSL streams are created:
 - Muse_EEG: 8 channels at 256 Hz (EEG + AUX)
 - Muse_ACCGYRO: 6 channels at 52 Hz (accelerometer + gyroscope)
 - Muse_OPTICS: 16 channels at 64 Hz (PPG sensors)
 - Muse_BATTERY: 1 channel at 1 Hz (battery percentage)
+- Muse_DRL: 2 channels at 32 Hz (DRL/REF electrode pair)
 
 Each stream includes:
 - Channel labels (from decode.py)
@@ -152,6 +153,7 @@ from .clocks import (
 from .decode import (
     ACCGYRO_CHANNELS,
     BATTERY_CHANNELS,
+    DRL_CHANNELS,
     make_timestamps,
     parse_message,
     select_eeg_channels,
@@ -229,6 +231,11 @@ def create_stream_outlet(
         sfreq = 1.0  # Both 0x88 and 0x98 status sequences advance once per second.
         stype = "Battery"
         source_id = f"{device_id}_battery"
+    elif sensor_type == "DRL":
+        ch_names = list(DRL_CHANNELS)
+        sfreq = 32.0
+        stype = "DRL"
+        source_id = f"{device_id}_drl"
     else:
         raise ValueError(f"Unknown sensor type: {sensor_type}")
 
@@ -382,7 +389,7 @@ async def _stream_async(
 
     # Default to all sensors if not specified
     if sensors is None:
-        sensors = ["EEG", "ACCGYRO", "OPTICS", "BATTERY"]
+        sensors = ["EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL"]
     else:
         # Normalize to uppercase
         sensors = [s.upper() for s in sensors]
@@ -390,7 +397,7 @@ async def _stream_async(
     # --- Stream State ---
     streams: Dict[str, SensorStream] = {}
     last_flush_time = 0.0
-    samples_sent = {"EEG": 0, "ACCGYRO": 0, "OPTICS": 0, "BATTERY": 0}
+    samples_sent = {"EEG": 0, "ACCGYRO": 0, "OPTICS": 0, "BATTERY": 0, "DRL": 0}
     start_time = 0.0
     last_data_time = 0.0  # Track when data was last received
     data_timeout_warned = False  # Only warn once per timeout period
@@ -520,7 +527,7 @@ async def _stream_async(
         lsl_now = local_clock()
 
         # Queue samples
-        for sensor_type in ["EEG", "ACCGYRO", "OPTICS", "BATTERY"]:
+        for sensor_type in ["EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL"]:
             sensor_data = decoded.get(sensor_type, np.empty((0, 0)))
             if sensor_data.size > 0:
                 _queue_samples(sensor_type, sensor_data, lsl_now)

@@ -743,7 +743,7 @@ def view(stream_name=None, address=None, window_duration=10.0, **kwargs):
         for info in infos:
             n = info.name
             if "Muse" in n:
-                if any(t in n for t in ["EEG", "ACCGYRO", "OPTICS", "BATTERY"]):
+                if any(t in n for t in ["EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL"]):
                     # Extract device ID from stream name (e.g., "Muse-EEG (00:55:DA:B9:FA:20)")
                     if "(" in n and ")" in n:
                         device_id = n.split("(")[-1].split(")")[0].strip()

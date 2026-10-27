@@ -8,7 +8,15 @@ The new decoder returns numpy arrays with timestamps instead of lists of dicts.
 import unittest
 import os
 import numpy as np
-from OpenMuse.decode import parse_message, decode_rawdata, SENSORS, make_timestamps, select_optics_channels
+from OpenMuse.decode import (
+    parse_message,
+    decode_rawdata,
+    SENSORS,
+    make_timestamps,
+    select_optics_channels,
+    _decode_drlref_data,
+    EEG_SCALE,
+)
 
 
 class TestGlobalTimestamping(unittest.TestCase):
@@ -58,7 +66,7 @@ class TestGlobalTimestamping(unittest.TestCase):
         self.assertIsInstance(result, dict)
 
         # Should have all sensor type keys
-        expected_keys = {"EEG", "ACCGYRO", "OPTICS", "BATTERY", "Unknown"}
+        expected_keys = {"EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL", "Unknown"}
         self.assertEqual(set(result.keys()), expected_keys)
 
         # Each value should be a DataFrame
@@ -211,7 +219,7 @@ class TestDecodeRawdata(unittest.TestCase):
         self.assertIsInstance(result, dict)
 
         # Should have all sensor type keys
-        expected_keys = {"EEG", "ACCGYRO", "OPTICS", "BATTERY", "Unknown"}
+        expected_keys = {"EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL", "Unknown"}
         self.assertEqual(set(result.keys()), expected_keys)
 
         # Each value should be a DataFrame
@@ -498,6 +506,71 @@ class TestNewFirmware(unittest.TestCase):
                         (4, 4),
                         f"EEG4 data should be (4, 4), got {data.shape}",
                     )
+
+
+class TestDRLRef(unittest.TestCase):
+    """Test suite for DRL/REF (TAG 0x53) decoding."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up test fixtures."""
+        cls.test_data_dir = os.path.join(os.path.dirname(__file__), "test_data")
+        cls.p1041_file = os.path.join(cls.test_data_dir, "data_p1041.txt")
+
+    def test_decode_drlref_data_worked_example(self):
+        """Unit test for _decode_drlref_data with a real 24-byte 0x53 body.
+
+        Captured on a live Muse S Athena (firmware 3.1.29). Layout: 6 samples
+        x 2 channels, int16 LE, interleaved [DRL, REF, ...].
+        """
+        data_bytes = bytes.fromhex(
+            "202045201f204c2020204a201f204b201f204c2020204c20"
+        )
+        self.assertEqual(len(data_bytes), 24)
+
+        result = _decode_drlref_data(data_bytes)
+
+        self.assertIsInstance(result, np.ndarray)
+        self.assertEqual(result.shape, (6, 2))
+
+        # Compare pre-scale integers so the test is independent of EEG_SCALE.
+        expected_drl = np.array([8224, 8223, 8224, 8223, 8223, 8224])
+        expected_ref = np.array([8261, 8268, 8266, 8267, 8268, 8268])
+        raw = np.rint(result / EEG_SCALE).astype(int)
+
+        np.testing.assert_array_equal(raw[:, 0], expected_drl)
+        np.testing.assert_array_equal(raw[:, 1], expected_ref)
+
+    def test_decode_drlref_data_short_input(self):
+        """Truncated 0x53 bodies must be rejected, not decoded."""
+        self.assertIsNone(_decode_drlref_data(b"\x00" * 23))
+
+    def test_drlref_integration_p1041(self):
+        """0x53 subpackets in data_p1041.txt must decode as a DRL stream.
+
+        Regression intent: 0x53 was previously type "Unknown" and its records
+        were dropped by _decode_subpacket_data.
+        """
+        with open(self.p1041_file, "r", encoding="utf-8") as f:
+            messages = [line.strip() for line in f if line.strip()]
+
+        result = decode_rawdata(messages)
+
+        self.assertIn("DRL", result)
+        drl_df = result["DRL"]
+        self.assertGreater(len(drl_df), 0, "data_p1041.txt should contain 0x53 DRL data")
+
+        # Columns: time + (DRL, REF)
+        self.assertEqual(list(drl_df.columns), ["time", "DRL", "REF"])
+
+        # Every decoded 0x53 subpacket reports 2 channels and 6 samples.
+        seen_records = set()
+        for message in messages:
+            parsed = parse_message(message)
+            for subpacket in parsed["DRL"]:
+                seen_records.add((subpacket["n_channels"], subpacket["n_samples"]))
+
+        self.assertEqual(seen_records, {(2, 6)})
 
 
 if __name__ == "__main__":
