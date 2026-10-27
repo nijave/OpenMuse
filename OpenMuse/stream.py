@@ -369,6 +369,15 @@ def _decode_with_channel_padding(
     return result_array, stream
 
 
+class StreamDisconnected(Exception):
+    """Raised when the BLE link to the device is lost while streaming."""
+
+
+# A reconnect attempt that streamed successfully for at least this long
+# restores the reconnect budget (see _stream_async_with_reconnect).
+_RECONNECT_RESET_SECONDS = 30.0
+
+
 async def _stream_async(
     address: str,
     preset: str,
@@ -377,6 +386,7 @@ async def _stream_async(
     verbose: bool = True,
     clock_model: str = "windowed",
     sensors: Optional[List[str]] = None,
+    streams: Optional[Dict[str, SensorStream]] = None,
 ):
     """Asynchronous context for BLE connection and LSL streaming.
 
@@ -385,6 +395,16 @@ async def _stream_async(
     sensors : Optional[List[str]]
         List of sensor types to stream. If None, streams all sensors.
         Valid values: "EEG", "ACCGYRO", "OPTICS", "BATTERY"
+    streams : Optional[Dict[str, SensorStream]]
+        Pre-existing sensor streams (LSL outlets + clock state) to reuse,
+        allowing outlets to survive across reconnect attempts. If None,
+        a fresh dict is created and outlets are created lazily on data.
+
+    Raises
+    ------
+    StreamDisconnected
+        If the BLE link is lost before the duration elapses. Buffering is
+        flushed before raising, so no received samples are lost.
     """
 
     # Default to all sensors if not specified
@@ -395,7 +415,8 @@ async def _stream_async(
         sensors = [s.upper() for s in sensors]
 
     # --- Stream State ---
-    streams: Dict[str, SensorStream] = {}
+    if streams is None:
+        streams = {}
     last_flush_time = 0.0
     samples_sent = {"EEG": 0, "ACCGYRO": 0, "OPTICS": 0, "BATTERY": 0, "DRL": 0}
     start_time = 0.0
@@ -557,6 +578,7 @@ async def _stream_async(
         if verbose:
             print("Streaming data... (Press Ctrl+C to stop)")
 
+        link_lost = False
         while True:
             await asyncio.sleep(0.5)
             elapsed = time.monotonic() - start_time
@@ -579,6 +601,7 @@ async def _stream_async(
             if not client.is_connected:
                 if verbose:
                     print(f"[{address}] WARNING: BLE disconnected after {elapsed:.1f}s")
+                link_lost = True
                 break
 
         # Final flush and summary
@@ -590,6 +613,99 @@ async def _stream_async(
             print(f"[{address}] Stream stopped after {elapsed:.1f}s")
             print(f"[{address}] Total samples sent: {samples_sent}")
 
+        if link_lost:
+            raise StreamDisconnected(
+                f"BLE link to {address} lost after {elapsed:.1f}s"
+            )
+
+
+async def _stream_async_with_reconnect(
+    address: str,
+    preset: str,
+    duration: Optional[float] = None,
+    raw_data_file: Optional[TextIO] = None,
+    verbose: bool = True,
+    clock_model: str = "windowed",
+    sensors: Optional[List[str]] = None,
+    *,
+    auto_reconnect: bool = False,
+    reconnect_attempts: int = 5,
+    reconnect_delay: float = 3.0,
+):
+    """Run _stream_async once, or retry across BLE link losses if enabled.
+
+    Without auto_reconnect this is a single, behaviourally identical call to
+    _stream_async. With auto_reconnect, a lost link (StreamDisconnected, or a
+    BleakError/OSError/TimeoutError while connecting or streaming) is retried
+    until `reconnect_attempts` consecutive failed attempts are exhausted; the
+    counter resets after any attempt that streamed for >= 30 s. `duration` is
+    shared across attempts: each retry gets the remaining time. A clean end
+    (duration elapsed, or caller cancel) always returns immediately — Ctrl+C
+    (asyncio.CancelledError) is never retried.
+
+    LSL outlets and clock state are reused across reconnect attempts so that
+    downstream consumers see one continuous stream.
+    """
+    if not auto_reconnect:
+        # Default path: identical to the pre-reconnect behaviour, where a lost
+        # link ended the stream quietly (the warning is printed inside
+        # _stream_async) instead of surfacing as an error.
+        try:
+            await _stream_async(
+                address, preset, duration, raw_data_file, verbose, clock_model, sensors
+            )
+        except StreamDisconnected:
+            pass
+        return
+
+    streams: Dict[str, SensorStream] = {}
+    stream_start = time.monotonic()
+    failed_attempts = 0
+
+    while True:
+        remaining: Optional[float] = None
+        if duration is not None:
+            remaining = duration - (time.monotonic() - stream_start)
+            if remaining <= 0:
+                return
+        attempt_start = time.monotonic()
+        try:
+            await _stream_async(
+                address,
+                preset,
+                remaining,
+                raw_data_file,
+                verbose,
+                clock_model,
+                sensors,
+                streams=streams,
+            )
+            # Clean end: duration elapsed (or caller cancelled). Never retry.
+            return
+        except asyncio.CancelledError:
+            raise
+        except (StreamDisconnected, BleakError, OSError, asyncio.TimeoutError) as e:
+            ran = time.monotonic() - attempt_start
+            if ran >= _RECONNECT_RESET_SECONDS:
+                # Link was healthy for a substantial stretch: restore budget.
+                failed_attempts = 0
+            else:
+                failed_attempts += 1
+            if failed_attempts >= reconnect_attempts:
+                if verbose:
+                    print(
+                        f"[{address}] Connection lost ({e}); giving up after "
+                        f"{failed_attempts} failed attempt(s)"
+                    )
+                raise
+            if verbose:
+                print(
+                    f"[{address}] Connection lost ({e}): reconnecting in "
+                    f"{reconnect_delay:.1f}s (attempt {failed_attempts}/"
+                    f"{reconnect_attempts})"
+                )
+            await asyncio.sleep(reconnect_delay)
+
 
 def stream(
     address: Union[str, List[str]],
@@ -599,6 +715,9 @@ def stream(
     verbose: bool = True,
     clock: str = "windowed",
     sensors: Optional[List[str]] = None,
+    auto_reconnect: bool = False,
+    reconnect_attempts: int = 5,
+    reconnect_delay: float = 3.0,
 ) -> None:
     """
     Stream decoded EEG and accelerometer/gyroscope data over LSL.
@@ -659,8 +778,17 @@ def stream(
 
             # Create task for this device
             tasks.append(
-                _stream_async(
-                    addr, preset, duration, raw_data_file, verbose, clock, sensors
+                _stream_async_with_reconnect(
+                    addr,
+                    preset,
+                    duration,
+                    raw_data_file,
+                    verbose,
+                    clock,
+                    sensors,
+                    auto_reconnect=auto_reconnect,
+                    reconnect_attempts=reconnect_attempts,
+                    reconnect_delay=reconnect_delay,
                 )
             )
 
