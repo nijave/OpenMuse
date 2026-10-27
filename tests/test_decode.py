@@ -773,5 +773,26 @@ class TestNoUnknownPacketTags(unittest.TestCase):
         )
 
 
+class TestBatteryPercentGuard(unittest.TestCase):
+    """A status body whose percent field is out of range decodes to NaN."""
+
+    def test_out_of_range_percent_is_nan(self):
+        from OpenMuse.decode import _decode_battery_data
+
+        body = bytearray.fromhex("d663c800c900d606ffffe00142722cce16ffe019")
+        body[0:2] = (150 * 256).to_bytes(2, "little")  # 150 % cannot be real
+        out = _decode_battery_data(bytes(body), 0x88)
+        self.assertTrue(np.isnan(out[0, 0]))
+        # The remaining fields still decode (voltage from the same body).
+        self.assertAlmostEqual(float(out[0, 7]), 4123.4375, places=3)
+
+    def test_in_range_percent_unchanged(self):
+        from OpenMuse.decode import _decode_battery_data
+
+        body = bytes.fromhex("d663c800c900d606ffffe00142722cce16ffe019")
+        out = _decode_battery_data(body, 0x88)
+        self.assertAlmostEqual(float(out[0, 0]), 99.8359375, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
