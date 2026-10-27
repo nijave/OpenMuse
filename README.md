@@ -54,6 +54,8 @@ OpenMuse record --address <your-muse-address> --duration 60 --outfile data.txt
 
 > [!TIP]
 > By default, recording and streaming use the `--preset p1041`, which enables all channels. You can change the preset using the `--preset` argument (see below for the list of documented presets).
+>
+> Run `OpenMuse presets` to print a table of the catalogued presets (`--model legacy` or `--model all` for older headbands, `--describe p1041` for one preset's details). An unrecognized `--preset` string is still sent to the device unchanged, with a warning.
 
 #### Loading Recorded Data
 
