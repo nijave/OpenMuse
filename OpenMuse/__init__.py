@@ -3,6 +3,7 @@
 from .decode import decode_rawdata, parse_message
 from .muse import find_muse
 from .muse import MuseS
+from .presets import PRESETS, describe_preset, preset_for_sensors
 from .record import record
 from .stream import stream
 from .view import view

@@ -2,6 +2,7 @@ import argparse
 import sys
 
 from .muse import find_muse
+from .presets import format_preset_fields, warn_if_unknown_preset
 from .record import record
 
 
@@ -59,6 +60,7 @@ def main(argv=None):
     def handle_record(ns):
         if ns.duration <= 0:
             parser.error("--duration must be positive")
+        warn_if_unknown_preset(ns.preset)
         record(
             address=ns.address,
             duration=ns.duration,
@@ -138,6 +140,7 @@ def main(argv=None):
 
         if ns.duration is not None and ns.duration <= 0:
             parser.error("--duration must be positive when provided")
+        warn_if_unknown_preset(ns.preset)
         stream(
             address=ns.address,
             preset=ns.preset,
@@ -150,6 +153,51 @@ def main(argv=None):
         return 0
 
     p_stream.set_defaults(func=handle_stream)
+
+    # presets subcommand
+    p_presets = subparsers.add_parser(
+        "presets",
+        help="Show the catalogue of documented Muse presets",
+    )
+    p_presets.add_argument(
+        "--model",
+        choices=["athena", "legacy", "all"],
+        default="athena",
+        help="Which presets to show (default: athena)",
+    )
+    p_presets.add_argument(
+        "--describe",
+        metavar="NAME",
+        default=None,
+        help="Print the fields of a single preset (e.g., --describe p1041)",
+    )
+
+    def handle_presets(ns):
+        from .presets import (
+            ATHENA_PRESETS,
+            ATHENA_PRESET_NAMES,
+            PRESETS,
+            describe_preset,
+            format_preset_table,
+        )
+
+        if ns.describe:
+            print(format_preset_fields(describe_preset(ns.describe)))
+            return 0
+        if ns.model == "athena":
+            presets = ATHENA_PRESETS
+        elif ns.model == "legacy":
+            presets = tuple(
+                p
+                for p in PRESETS.values()
+                if not any(m.startswith("muse2025") for m in p.models)
+            )
+        else:
+            presets = tuple(PRESETS.values())
+        print(format_preset_table(presets))
+        return 0
+
+    p_presets.set_defaults(func=handle_presets)
 
     # view subcommand
     p_view = subparsers.add_parser(
