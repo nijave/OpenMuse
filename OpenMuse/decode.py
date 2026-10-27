@@ -42,6 +42,7 @@ Hardware Timing Artifacts:
 """
 
 import struct
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 from datetime import datetime
@@ -877,20 +878,41 @@ def make_timestamps(
             for subpkt in sorted_subpackets
         )
 
-        # Get number of channels from first subpacket
-        # Handle both 1D and 2D arrays (Battery data is 1D)
-        first_data = sorted_subpackets[0]["data"]
-        if first_data.ndim == 1:
-            n_channels = 1
-            # Ensure 1D arrays are reshaped for consistency
-            for subpkt in sorted_subpackets:
-                if subpkt["data"].ndim == 1:
-                    subpkt["data"] = subpkt["data"].reshape(-1, 1)
+        # Normalise every subpacket to 2D up front (Battery data is 1D) so the
+        # width checks below can rely on data.shape[1].
+        for subpkt in sorted_subpackets:
+            if subpkt["data"].ndim == 1:
+                subpkt["data"] = subpkt["data"].reshape(-1, 1)
+
+        # The stream width is the width carrying the most samples across all
+        # subpackets (ties go to the wider width), NOT the first subpacket's
+        # width: a preset switch mid-recording can mix EEG4 (0x11) and EEG8
+        # (0x12) subpackets into one EEG stream (likewise Optics4/8/16), and
+        # taking the first subpacket's width would crash the assignment below.
+        # Subpackets with data.ndim != 2 are malformed and cannot vote.
+        width_votes = {}
+        for subpkt in sorted_subpackets:
+            data = subpkt["data"]
+            if data.ndim != 2:
+                continue
+            votes = width_votes.get(data.shape[1], 0)
+            width_votes[data.shape[1]] = votes + subpkt.get(
+                "n_samples", n_samples_per_subpkt
+            )
+        if width_votes:
+            stream_width = max(width_votes, key=lambda w: (width_votes[w], w))
         else:
-            n_channels = first_data.shape[1]
+            stream_width = 1
+
+        # The EEG-only NaN-padding rule is decided by the stream's sensor type,
+        # taken from the first subpacket's TAG. EEG4's channels 0-3 (TP9/AF7/
+        # AF8/TP10) are a true prefix of EEG8's, so a narrow EEG subpacket can
+        # be padded with NaN for the absent AUX channels; Optics4 is a different
+        # physical sensor selection, not the first four channels of Optics16.
+        stream_sensor_type = config.get("type")
 
         # Pre-allocate arrays for efficiency
-        data_array = np.empty((total_samples, n_channels), dtype=np.float32)
+        data_array = np.empty((total_samples, stream_width), dtype=np.float32)
         times_array = np.empty(total_samples, dtype=np.float64)
 
         clock_mod = 1 << 32
@@ -910,6 +932,9 @@ def make_timestamps(
         base_tick = first_raw_tick
 
         row_idx = 0
+        n_malformed = 0  # subpackets dropped outright
+        n_padded = 0  # narrower subpackets NaN-padded up to the stream width
+        n_padded_samples = 0  # samples recovered by NaN-padding
 
         for subpkt in sorted_subpackets:
             data = subpkt["data"]
@@ -966,6 +991,29 @@ def make_timestamps(
                 base_time + (relative_samples + np.arange(n_samples)) / sampling_rate
             )
 
+            # Mixed-width tolerance: never raise on a shape mismatch. A
+            # malformed (non-2D) or width-mismatched subpacket that cannot be
+            # padded is dropped and counted instead of losing the whole stream.
+            if data.ndim != 2:
+                n_malformed += 1
+                continue
+            width = data.shape[1]
+            if width != stream_width:
+                if stream_sensor_type == "EEG" and width < stream_width:
+                    # NaN-pad the narrow EEG subpacket up to the stream width:
+                    # real values in the leading channels, NaN for the absent
+                    # higher-numbered channels.
+                    padded = np.full(
+                        (n_samples, stream_width), np.nan, dtype=np.float32
+                    )
+                    padded[:, :width] = data
+                    data = padded
+                    n_padded += 1
+                    n_padded_samples += n_samples
+                else:
+                    n_malformed += 1
+                    continue
+
             # Copy data and timestamps into pre-allocated arrays
             data_array[row_idx : row_idx + n_samples] = data
             times_array[row_idx : row_idx + n_samples] = times
@@ -976,10 +1024,21 @@ def make_timestamps(
 
     # Add timestamps as first column
     assert base_time is not None  # Should always be set by now
-    if data_array.size > 0:
-        times_col = times_array.reshape(-1, 1).astype(np.float64)
+    # Dropped subpackets never advanced row_idx, so trim the pre-allocated
+    # arrays down to the rows actually filled.
+    if row_idx > 0:
+        if n_malformed or n_padded:
+            warnings.warn(
+                f"decode: {n_malformed} malformed subpacket(s) dropped and "
+                f"{n_padded} narrower subpacket(s) NaN-padded while assembling "
+                f"a {stream_width}-channel stream ({n_padded_samples} samples "
+                "recovered).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        times_col = times_array[:row_idx].reshape(-1, 1).astype(np.float64)
         return (
-            np.hstack((times_col, data_array)),
+            np.hstack((times_col, data_array[:row_idx])),
             base_time,
             wrap_offset,
             last_abs_tick,

@@ -8,6 +8,7 @@ The new decoder returns numpy arrays with timestamps instead of lists of dicts.
 import unittest
 import os
 import glob
+import warnings
 from datetime import datetime
 
 import numpy as np
@@ -771,6 +772,129 @@ class TestNoUnknownPacketTags(unittest.TestCase):
             0,
             "No packet tags were seen across fixtures; the walk parsed nothing",
         )
+
+
+class TestMixedWidthAssembly(unittest.TestCase):
+    """make_timestamps must survive mixed-width subpackets in one stream.
+
+    A preset switch mid-recording pools EEG4 (0x11, 4 ch) and EEG8 (0x12,
+    8 ch) subpackets into the same EEG stream; the same applies to the three
+    OPTICS layouts (0x34/0x35/0x36). The old code took the channel count from
+    the FIRST subpacket and raised ValueError on the first mismatch, losing
+    the entire file.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.test_data_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "test_data"
+        )
+
+    def subpacket(self, tag, data, pkt_index, subpkt_index=0):
+        """Build a subpacket dict shaped like parse_message + decode output."""
+        config = SENSORS[tag]
+        return {
+            "sensor_type": config["type"],
+            "tag_byte": tag,
+            "subpkt_index": subpkt_index,
+            "data": data,
+            "n_channels": config["n_channels"],
+            "n_samples": config["n_samples"],
+            "pkt_index": pkt_index,
+            "pkt_time": 0.0,
+            "pkt_time_raw": 1000 + pkt_index,
+            "message_time": "2026-01-01T00:00:00+00:00",
+            "message_uuid": "mixed-width-test",
+        }
+
+    def test_eeg4_padded_into_eeg8_stream(self):
+        """5 EEG8 subpackets + 1 EEG4 subpacket -> width 8, EEG4 NaN-padded."""
+        eeg8 = [
+            self.subpacket(0x12, np.full((2, 8), i, dtype=np.float32), i, i)
+            for i in range(5)
+        ]
+        eeg4 = self.subpacket(0x11, np.full((4, 4), 99, dtype=np.float32), 5, 0)
+        with self.assertWarns(RuntimeWarning) as ctx:
+            samples, *_ = make_timestamps(eeg8 + [eeg4])
+        self.assertEqual(samples.shape, (14, 9))
+        # The EEG4 subpacket sorts last (pkt_index 5): rows 10-13. Its real
+        # values stay in the leading four channels; channels 5-8 are NaN.
+        narrow = samples[10:, 1:]
+        np.testing.assert_array_equal(
+            narrow[:, :4], np.full((4, 4), 99, dtype=np.float32)
+        )
+        self.assertTrue(np.isnan(narrow[:, 4:]).all())
+        self.assertFalse(np.isnan(samples[:10, 1:]).any())
+        message = str(ctx.warning)
+        # The padded narrow subpacket counts as "narrower", not malformed.
+        self.assertIn("0 malformed", message)
+        self.assertIn("1 narrower", message)
+        self.assertIn("8-channel", message)
+        self.assertIn("4 samples recovered", message)
+
+    def test_majority_width_wins_and_wide_subpacket_dropped(self):
+        """1 EEG8 subpacket + 5 EEG4 subpackets -> width 4, wide one dropped."""
+        wide = self.subpacket(0x12, np.full((2, 8), 7, dtype=np.float32), 0, 0)
+        narrow = [
+            self.subpacket(0x11, np.full((4, 4), 3, dtype=np.float32), i + 1, i)
+            for i in range(5)
+        ]
+        with self.assertWarns(RuntimeWarning):
+            samples, *_ = make_timestamps([wide] + narrow)
+        # The narrow width carries 20 samples vs 2, so it wins; the single
+        # wide subpacket is dropped (5*4 = 20 rows, 4 channels + time).
+        self.assertEqual(samples.shape, (20, 5))
+        np.testing.assert_array_equal(
+            samples[:, 1:], np.full((20, 4), 3, dtype=np.float32)
+        )
+
+    def test_optics4_dropped_not_padded(self):
+        """Optics4 is a different sensor selection, never padded into Optics16."""
+        optics16 = [
+            self.subpacket(0x36, np.full((1, 16), i, dtype=np.float32), i, i)
+            for i in range(3)
+        ]
+        optics4 = self.subpacket(0x34, np.full((3, 4), 42, dtype=np.float32), 3, 0)
+        with self.assertWarns(RuntimeWarning):
+            samples, *_ = make_timestamps(optics16 + [optics4])
+        # 3 samples each: tie goes to the wider (16ch); the Optics4 subpacket
+        # is dropped, not padded.
+        self.assertEqual(samples.shape, (3, 17))
+        self.assertFalse(np.isnan(samples).any())
+        np.testing.assert_array_equal(
+            samples[:, 1:],
+            np.array([[i] * 16 for i in range(3)], dtype=np.float32),
+        )
+
+    def test_uniform_widths_emit_no_warning(self):
+        """Uniform-width streams behave exactly as before and stay silent."""
+        subpkts = [
+            self.subpacket(0x12, np.full((2, 8), i, dtype=np.float32), i, i)
+            for i in range(4)
+        ]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            samples, *_ = make_timestamps(subpkts)
+        self.assertEqual(caught, [])
+        self.assertEqual(samples.shape, (8, 9))
+        for i in range(4):
+            np.testing.assert_array_equal(
+                samples[2 * i : 2 * i + 2, 1:],
+                np.full((2, 8), i, dtype=np.float32),
+            )
+
+    def test_decode_rawdata_survives_mixed_eeg4_eeg8_fixture_lines(self):
+        """Regression: an EEG8 line + an EEG4 line must decode without raising."""
+        with open(os.path.join(self.test_data_dir, "data_p1041.txt")) as f:
+            eeg8_line = next(f).strip()
+        with open(os.path.join(self.test_data_dir, "data_p1035.txt")) as f:
+            eeg4_line = next(f).strip()
+        data = decode_rawdata([eeg8_line, eeg4_line])
+        self.assertIn("EEG", data)
+        eeg = data["EEG"]
+        self.assertTrue(hasattr(eeg, "columns"), "EEG result must be a DataFrame")
+        self.assertGreater(len(eeg), 0, "mixed EEG4/EEG8 stream must yield EEG rows")
+        self.assertEqual(eeg.columns[0], "time")
 
 
 if __name__ == "__main__":
