@@ -172,9 +172,10 @@ Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/
 | p1041, p1042                            | EEG8  | Optics16 |    X     |    X    | bright  |
 | p1045                                   | EEG8  | Optics4  |    X     |    X    |  dim    |
 | p1046                                   | EEG8  | Optics4  |    X     |    X    |   —     |
-| p4129                                   | EEG8  | Optics4  |    X     |    X    |  dim    |
 
 *Table derived from the signature of the data packets present in the data. More presets could exist.*
+
+*No `p4129` preset exists: the headband reports its current preset as the hex id in decimal (`"ps":4129` is `0x1021`, i.e. `p1021`), and the firmware rejects the literal string `p4129`. The fixture `tests/test_data/data_p4129.txt` holds whatever preset the device already had. Run `OpenMuse presets` for the full catalogue.*
 
 ### Acknowledgements
 
