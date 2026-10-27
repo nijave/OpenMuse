@@ -73,7 +73,8 @@ def main(argv=None):
     # stream subcommand
     p_stream = subparsers.add_parser(
         "stream",
-        help="Stream decoded EEG and accelerometer/gyroscope data over LSL",
+        help="Stream decoded EEG and accelerometer/gyroscope data over LSL "
+        "(optional auto-reconnect for long recordings)",
     )
     p_stream.add_argument(
         "--address",
@@ -132,6 +133,27 @@ def main(argv=None):
         choices=["EEG", "ACCGYRO", "OPTICS", "BATTERY", "DRL"],
         help="Sensor types to stream (default: all). Example: --sensors EEG OPTICS",
     )
+    p_stream.add_argument(
+        "--auto-reconnect",
+        action="store_true",
+        help="Automatically reconnect and resume streaming if the BLE link is lost "
+        "(useful for long/overnight recordings). Raw recording continues appending "
+        "to the same file and LSL outlets are reused across reconnects.",
+    )
+    p_stream.add_argument(
+        "--reconnect-attempts",
+        type=int,
+        default=5,
+        help="Maximum consecutive failed reconnect attempts before giving up "
+        "(default: 5). The counter resets after any attempt that streamed "
+        "successfully for at least 30 seconds.",
+    )
+    p_stream.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait between reconnect attempts (default: 3.0)",
+    )
 
     def handle_stream(ns):
         from .stream import stream
@@ -146,6 +168,9 @@ def main(argv=None):
             verbose=True,
             clock=ns.clock,
             sensors=ns.sensors,
+            auto_reconnect=ns.auto_reconnect,
+            reconnect_attempts=ns.reconnect_attempts,
+            reconnect_delay=ns.reconnect_delay,
         )
         return 0
 

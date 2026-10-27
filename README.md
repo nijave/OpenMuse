@@ -95,6 +95,8 @@ The following options are available:
 - `--duration`: Duration of the recording in seconds (if not specified, streaming will continue until you press Ctrl+C in the terminal)
 - `--preset`: Preset configuration (default: `p1041` for all channels)
 - `--record`: Record raw BLE packets to a file (optional)
+- `--auto-reconnect`: Automatically reconnect and resume streaming if the BLE link drops (recommended for long/overnight recordings); LSL outlets are reused so downstream sees one continuous stream
+- `--reconnect-attempts` / `--reconnect-delay`: Maximum consecutive failed reconnect attempts (default 5) and seconds between attempts (default 3.0); the attempt counter resets after any 30 s of successful streaming
 
 ### Visualize Live Streams
 
