@@ -182,20 +182,21 @@ OPTICS_CHANNELS = (
 
 # Battery/status packet (TAG 0x88): 10 little-endian 16-bit fields. Field
 # identities fitted on 1,071 real status packets across a 37-minute discharge
-# (99.9 % → 90.4 %) on firmware 3.1.29, cross-checked against the vendor
-# SDK's IXNBattery enum and standard fuel-gauge register scaling. Index in
-# this tuple == 16-bit field index in the packet body.
+# (99.9 % → 90.4 %) on firmware 3.1.29; scales confirmed by disassembling the
+# vendor SDK's conversion routine (interaxon::nevis::ParsedPacket::convert,
+# BATTERY branch, libmuse 8.0.9). Index in this tuple == 16-bit field index
+# in the packet body.
 BATTERY_CHANNELS = (
-    "BATTERY_PERCENT",  # idx 0: raw / 256.0 (verified)
-    "REMAINING_CAPACITY",  # idx 1: raw, tracks SoC; same unit as FULL_CAPACITY (likely mAh, unit not pinned)
-    "FULL_CAPACITY",  # idx 2: raw, constant 201 on the test device
-    "TIME_TO_EMPTY_INST_RAW",  # idx 3: raw, jumpy, inversely proportional to current; scaling NOT confirmed
+    "BATTERY_PERCENT",  # idx 0: raw / 256.0 (verified on data)
+    "REMAINING_CAPACITY_MAH",  # idx 1: raw * 5.0/7.0 mAh/LSB (SDK binary)
+    "FULL_CAPACITY_MAH",  # idx 2: raw * 5.0/7.0 mAh/LSB (SDK binary)
+    "TIME_TO_EMPTY_S",  # idx 3: raw * 5.625; jumpy — gauge uses instantaneous current
     "TIME_TO_FULL_S",  # idx 4: raw * 5.625; 0xFFFF is the "not charging" sentinel → NaN
-    "CYCLES",  # idx 5: raw * 0.01 (charge/discharge cycle count)
-    "BATTERY_AGE_RAW",  # idx 6: raw, constant 29250; probably raw/256 but NOT confirmed — exposed raw
+    "CYCLES",  # idx 5: raw (SDK passes through unscaled); fuel-gauge convention 1 LSB = 1 % of a cycle (480 ≈ 4.8 cycles)
+    "BATTERY_AGE_PERCENT",  # idx 6: raw / 256.0; gauge "age" = full/design capacity, can exceed 100 % (~114 % on test device)
     "VOLTAGE_MV",  # idx 7: raw * 0.078125 (78.125 µV/LSB)
     "CURRENT_MA",  # idx 8: int16 raw * 0.15625 (156.25 µA/LSB); negative = discharging
-    "TIME_TO_EMPTY_S",  # idx 9: raw * 5.625 (smoothed time-to-empty)
+    "TEMPERATURE_C",  # idx 9: int16 raw / 256.0 (headband temperature)
 )
 
 # DRL/REF electrode pair: channel 0 = DRL (driven electrode, pinned near the
@@ -580,28 +581,36 @@ def _decode_battery_data(data_bytes: bytes, tag_byte: int) -> Optional[np.ndarra
     (Samples_10x16bit in the vendor firmware), decoded per BATTERY_CHANNELS.
 
     The field identities were fitted on 1,071 real 0x88 status packets
-    (37-minute discharge, 99.9 % → 90.4 %, firmware 3.1.29). The same layout
-    was then verified on the 0x98-tagged capture tests/test_data/
-    data_p1041.txt (same firmware era, 59 packets): percent tracks idx 0,
-    voltage sits at 3844-3886 mV, current is strictly negative while
-    discharging, and the FULL_CAPACITY (idx 2) and BATTERY_AGE (idx 6)
-    constants match the 0x88 fit. Field confidence, mirroring that fit:
+    (37-minute discharge, 99.9 % → 90.4 %, firmware 3.1.29); the conversion
+    scales were confirmed by disassembling the vendor SDK's conversion
+    routine (interaxon::nevis::ParsedPacket::convert, BATTERY branch,
+    libmuse 8.0.9). The same layout was then verified on the 0x98-tagged
+    capture tests/test_data/data_p1041.txt (same firmware era, 59 packets):
+    percent tracks idx 0, voltage sits at 3844-3886 mV, current is strictly
+    negative while discharging, and FULL_CAPACITY_MAH (idx 2) and
+    BATTERY_AGE_PERCENT (idx 6) constants match the 0x88 fit. Field
+    confidence:
 
-    - idx 0 BATTERY_PERCENT: verified (raw / 256.0).
-    - idx 1 REMAINING_CAPACITY / idx 2 FULL_CAPACITY: raw, track SoC; same
-      (unpinned, likely mAh) unit.
-    - idx 3 TIME_TO_EMPTY_INST_RAW: raw; jumpy, inversely proportional to
-      current; probably instantaneous time-to-empty in 5.625 s units but NOT
-      confirmed — exposed raw.
-    - idx 4 TIME_TO_FULL_S: raw * 5.625; 0xFFFF is the "not charging"
-      sentinel and decodes to NaN.
-    - idx 5 CYCLES: raw * 0.01.
-    - idx 6 BATTERY_AGE_RAW: raw (constant 29250 on the test device); vendor
-      enum says "battery age %", probably raw/256 but NOT confirmed — raw.
-    - idx 7 VOLTAGE_MV: raw * 0.078125 (78.125 µV/LSB; 4137 mV at full charge).
-    - idx 8 CURRENT_MA: int16 raw * 0.15625 (156.25 µA/LSB); negative =
-      discharging (−9 mA idle … −69 mA at 16-ch high-power optics).
-    - idx 9 TIME_TO_EMPTY_S: raw * 5.625 (smoothed time-to-empty).
+    - idx 0 BATTERY_PERCENT: verified on data (raw / 256.0).
+    - idx 1 REMAINING_CAPACITY_MAH / idx 2 FULL_CAPACITY_MAH: scale
+      5.0/7.0 mAh/LSB from the SDK binary (constant 0x3fe6db6db6db6db7),
+      consistent with data.
+    - idx 3 TIME_TO_EMPTY_S: scale 5.625 from the SDK binary; jumpy because
+      the gauge uses instantaneous current.
+    - idx 4 TIME_TO_FULL_S: scale 5.625 from the SDK binary; 0xFFFF is the
+      "not charging" sentinel and decodes to NaN.
+    - idx 5 CYCLES: passed through raw, as the SDK does; fuel-gauge
+      convention is 1 LSB = 1 % of a cycle (480 ≈ 4.8 cycles).
+    - idx 6 BATTERY_AGE_PERCENT: scale raw / 256.0 from the SDK binary;
+      gauge "age" = full/design capacity and can exceed 100 % (~114 % on
+      the test device).
+    - idx 7 VOLTAGE_MV: verified on data (raw * 0.078125, 78.125 µV/LSB;
+      4137 mV at full charge).
+    - idx 8 CURRENT_MA: verified on data (int16 raw * 0.15625,
+      156.25 µA/LSB); negative = discharging (−9 mA idle … −69 mA at 16-ch
+      high-power optics).
+    - idx 9 TEMPERATURE_C: scale from the SDK binary (int16 raw / 256.0);
+      runs 25.8 → 33.2 °C as the headband warms on the capture.
 
     Returns: np.ndarray shape (1, 10), or None if fewer than 20 bytes.
     """
@@ -611,16 +620,16 @@ def _decode_battery_data(data_bytes: bytes, tag_byte: int) -> Optional[np.ndarra
     raw = np.frombuffer(data_bytes[:20], dtype="<u2", count=10)
     data = np.empty(10, dtype=np.float32)
     data[0] = raw[0] / 256.0
-    data[1] = raw[1]  # raw, unit not pinned (likely mAh, same unit as idx 2)
-    data[2] = raw[2]  # raw
-    data[3] = raw[3]  # raw, scaling NOT confirmed
+    data[1] = raw[1] * (5.0 / 7.0)
+    data[2] = raw[2] * (5.0 / 7.0)
+    data[3] = raw[3] * 5.625
     # 0xFFFF = "not charging" sentinel → NaN
     data[4] = raw[4] * 5.625 if raw[4] != 0xFFFF else np.nan
-    data[5] = raw[5] * 0.01
-    data[6] = raw[6]  # raw, scaling NOT confirmed
+    data[5] = raw[5]  # passed through raw, as the SDK does
+    data[6] = raw[6] / 256.0
     data[7] = raw[7] * 0.078125
     data[8] = np.frombuffer(data_bytes[16:18], dtype="<i2", count=1)[0] * 0.15625
-    data[9] = raw[9] * 5.625
+    data[9] = np.frombuffer(data_bytes[18:20], dtype="<i2", count=1)[0] / 256.0
 
     return data.reshape(1, 10)
 

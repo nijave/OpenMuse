@@ -386,15 +386,15 @@ class TestBattery(unittest.TestCase):
 
         expected = [
             99.8359375,  # BATTERY_PERCENT: 25558 / 256
-            200.0,  # REMAINING_CAPACITY
-            201.0,  # FULL_CAPACITY
-            1750.0,  # TIME_TO_EMPTY_INST_RAW
+            142.857142857,  # REMAINING_CAPACITY_MAH: 200 * 5/7
+            143.571428571,  # FULL_CAPACITY_MAH: 201 * 5/7
+            9843.75,  # TIME_TO_EMPTY_S: 1750 * 5.625
             np.nan,  # TIME_TO_FULL_S: 0xFFFF sentinel
-            4.80,  # CYCLES: 480 * 0.01
-            29250.0,  # BATTERY_AGE_RAW
+            480.0,  # CYCLES: raw (1 LSB = 1 % of a cycle → ≈ 4.8 cycles)
+            114.2578125,  # BATTERY_AGE_PERCENT: 29250 / 256
             4123.4375,  # VOLTAGE_MV: 52780 * 0.078125
             -36.5625,  # CURRENT_MA: int16 -234 * 0.15625
-            37260.0,  # TIME_TO_EMPTY_S: 6624 * 5.625
+            25.875,  # TEMPERATURE_C: int16 6624 / 256
         ]
         np.testing.assert_allclose(decoded[0], expected, rtol=1e-6)
         self.assertTrue(np.isnan(decoded[0][4]))
@@ -417,23 +417,23 @@ class TestBattery(unittest.TestCase):
     def test_legacy_battery_0x98_same_layout(self):
         """0x98 (data_p1041 era) uses the same 10-field layout as 0x88."""
         # Real 0x98 body from tests/test_data/data_p1041.txt: 80.22 %,
-        # 140 remaining / 175 full capacity, not-charging sentinel, 1.34
-        # cycles, 3885.5 mV, -55.6 mA discharge, ~12.2 h to empty.
+        # 100 remaining / 125 full mAh, not-charging sentinel, 134 cycle %,
+        # 3885.5 mV, -55.6 mA discharge, 30.46 °C.
         body = bytes.fromhex("39508c00af006602ffff8600427247c29cfe761e")
         decoded = _decode_battery_data(body, 0x98)
         self.assertIsNotNone(decoded)
         self.assertEqual(decoded.shape, (1, 10))
         expected = [
             80.22265625,  # 20537 / 256
-            140.0,
-            175.0,
-            614.0,
+            100.0,  # 140 * 5/7
+            125.0,  # 175 * 5/7
+            3453.75,  # 614 * 5.625
             np.nan,  # 0xFFFF sentinel
-            1.34,  # 134 * 0.01
-            29250.0,
+            134.0,  # raw (1 LSB = 1 % of a cycle)
+            114.2578125,  # 29250 / 256
             3885.546875,  # 49735 * 0.078125
             -55.625,  # int16 -356 * 0.15625
-            43863.75,  # 7798 * 5.625
+            30.4609375,  # int16 7798 / 256
         ]
         np.testing.assert_allclose(decoded[0], expected, rtol=1e-6)
 
@@ -475,11 +475,23 @@ class TestBattery(unittest.TestCase):
             f"current_ma must be strictly negative (discharging), got {current.min()}..{current.max()}",
         )
 
-        full_capacity = battery_df["full_capacity"]
+        full_capacity = battery_df["full_capacity_mah"]
         self.assertEqual(
             full_capacity.nunique(),
             1,
-            f"full_capacity should be constant, got {full_capacity.unique()}",
+            f"full_capacity_mah should be constant, got {full_capacity.unique()}",
+        )
+
+        temperature = battery_df["temperature_c"]
+        self.assertTrue(
+            ((temperature >= 10) & (temperature <= 45)).all(),
+            f"temperature_c out of [10, 45]: {temperature.min()}..{temperature.max()}",
+        )
+
+        time_to_empty = battery_df["time_to_empty_s"]
+        self.assertTrue(
+            (time_to_empty > 0).all(),
+            f"time_to_empty_s must be positive, got {time_to_empty.min()}..{time_to_empty.max()}",
         )
 
 
