@@ -56,6 +56,18 @@ DEVICE_CLOCK_HZ = 256000.0  # Device clock frequency: 256 kHz
 
 # Sensor configuration mapping
 # Maps TAG byte to sensor type, channels, samples, sampling rate, and data length
+#
+# The firmware builds each TAG as (freq_code << 4) | sensor_type: low nibble
+# 1/2 = EEG (4/8 ch), 3 = DRL/REF, 4/5/6 = optics (4/8/16 ch), 7 = IMU,
+# 8 = battery/status; high nibble 1 = 256 Hz, 2 = 128, 3 = 64, 4 = 52,
+# 5 = 32, 6 = 16, 8 = 1 Hz. A sweep of all 23 Muse S Athena (MS-03) presets
+# on firmware 3.1.29 (p1021-p1029, p102a, p1031-p1036, p1041-p1046, p21)
+# produced only the tags listed below, each at a single rate, so the table
+# is complete for Athena. The vendor preset list documents two Muse S gen-2
+# (MS-02) presets, p54 and p55, that stream EEG at 128 Hz with 16 Hz DRL/REF;
+# those would arrive as 0x21/0x22 (EEG) and 0x63 (DRL/REF) and are not
+# handled here (no capture exists). tests/test_decode.py guards against any
+# fixture carrying a tag missing from this table.
 SENSORS = {
     0x11: {
         "type": "EEG",
