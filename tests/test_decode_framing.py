@@ -51,7 +51,7 @@ class TestStatusFraming(unittest.TestCase):
         body = bytes(status) + subpacket(0x36, optics) + subpacket(0x12, bytes(28))
         parsed = parse_message(message(packet(0x88, body)))
         self.assertEqual(len(parsed["BATTERY"]), 1)
-        self.assertEqual(parsed["BATTERY"][0]["data"][0], 69.0703125)
+        self.assertEqual(parsed["BATTERY"][0]["data"][0][0], 69.0703125)
         self.assertEqual([p["tag_byte"] for p in parsed["EEG"]], [0x12])
         self.assertEqual([p["tag_byte"] for p in parsed["OPTICS"]], [0x36])
         samples, *_ = make_timestamps(parsed["EEG"])
@@ -67,7 +67,7 @@ class TestStatusFraming(unittest.TestCase):
         self.assertEqual(len(parsed["ACCGYRO"]), 1)
         self.assertEqual(parsed["EEG"], [])
         self.assertEqual(len(parsed["BATTERY"]), 1)
-        self.assertEqual(parsed["BATTERY"][0]["data"][0], 50.5703125)
+        self.assertEqual(parsed["BATTERY"][0]["data"][0][0], 50.5703125)
 
     def test_status_can_precede_each_supported_sensor_variant(self):
         for tag, sensor, size, rows, columns in VARIANTS:
@@ -96,13 +96,15 @@ class TestStatusFraming(unittest.TestCase):
         payload = packet(0x88, status_body(), 0) + packet(0x88, status_body(), 1)
         parsed = parse_message(message(payload))
         samples, *_ = make_timestamps(parsed["BATTERY"])
-        np.testing.assert_allclose(samples, [[0.0, 50.0], [1.0, 50.0]])
+        # Battery samples now carry all 10 status fields (time + 10 columns).
+        self.assertEqual(samples.shape, (2, 11))
+        np.testing.assert_allclose(samples[:, :2], [[0.0, 50.0], [1.0, 50.0]])
 
     def test_legacy_battery_format_remains_supported(self):
         parsed = parse_message(message(packet(0x98, status_body(42))))
         self.assertEqual(len(parsed["BATTERY"]), 1)
         self.assertEqual(parsed["BATTERY"][0]["tag_byte"], 0x98)
-        self.assertEqual(parsed["BATTERY"][0]["data"][0], 42.0)
+        self.assertEqual(parsed["BATTERY"][0]["data"][0][0], 42.0)
 
 
 class TestPacketFraming(unittest.TestCase):

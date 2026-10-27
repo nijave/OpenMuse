@@ -112,16 +112,21 @@ SENSORS = {
     # New firmware battery/status data is 20 bytes, like 0x98. Longer BLE
     # packets contain additional tagged sensor subpackets, not a larger status
     # body. Consuming them as status data loses samples and breaks framing.
+    #
+    # Both tags carry the same body: 10 little-endian uint16 fields (one
+    # 16-bit field per channel; see BATTERY_CHANNELS and
+    # _decode_battery_data). The layout was fitted on 0x88 packets and
+    # cross-verified on the 0x98-tagged data_p1041.txt capture.
     0x88: {
         "type": "BATTERY",
-        "n_channels": 1,
+        "n_channels": 10,
         "n_samples": 1,
         "rate": 1.0,
         "data_len": 20,
     },
     0x98: {
         "type": "BATTERY",
-        "n_channels": 1,
+        "n_channels": 10,
         "n_samples": 1,
         "rate": 1.0,
         "data_len": 20,
@@ -175,7 +180,23 @@ OPTICS_CHANNELS = (
     "OPTICS_RO_IR",
 )
 
-BATTERY_CHANNELS = ("BATTERY_PERCENT",)
+# Battery/status packet (TAG 0x88): 10 little-endian 16-bit fields. Field
+# identities fitted on 1,071 real status packets across a 37-minute discharge
+# (99.9 % → 90.4 %) on firmware 3.1.29, cross-checked against the vendor
+# SDK's IXNBattery enum and standard fuel-gauge register scaling. Index in
+# this tuple == 16-bit field index in the packet body.
+BATTERY_CHANNELS = (
+    "BATTERY_PERCENT",  # idx 0: raw / 256.0 (verified)
+    "REMAINING_CAPACITY",  # idx 1: raw, tracks SoC; same unit as FULL_CAPACITY (likely mAh, unit not pinned)
+    "FULL_CAPACITY",  # idx 2: raw, constant 201 on the test device
+    "TIME_TO_EMPTY_INST_RAW",  # idx 3: raw, jumpy, inversely proportional to current; scaling NOT confirmed
+    "TIME_TO_FULL_S",  # idx 4: raw * 5.625; 0xFFFF is the "not charging" sentinel → NaN
+    "CYCLES",  # idx 5: raw * 0.01 (charge/discharge cycle count)
+    "BATTERY_AGE_RAW",  # idx 6: raw, constant 29250; probably raw/256 but NOT confirmed — exposed raw
+    "VOLTAGE_MV",  # idx 7: raw * 0.078125 (78.125 µV/LSB)
+    "CURRENT_MA",  # idx 8: int16 raw * 0.15625 (156.25 µA/LSB); negative = discharging
+    "TIME_TO_EMPTY_S",  # idx 9: raw * 5.625 (smoothed time-to-empty)
+)
 
 # DRL/REF electrode pair: channel 0 = DRL (driven electrode, pinned near the
 # 14-bit ADC mid-rail), channel 1 = REF (reference, varies with contact).
@@ -483,7 +504,7 @@ def _decode_subpacket_data(subpkt: Dict) -> Optional[Dict]:
     if sensor_type == "ACCGYRO":
         data = _decode_accgyro_data(data_bytes)
     elif sensor_type == "BATTERY":
-        data = _decode_battery_data(data_bytes)
+        data = _decode_battery_data(data_bytes, tag_byte)
     elif sensor_type == "DRL":
         data = _decode_drlref_data(data_bytes)
     elif sensor_type == "EEG":
@@ -551,23 +572,57 @@ def _decode_drlref_data(data_bytes: bytes) -> Optional[np.ndarray]:
     return data
 
 
-def _decode_battery_data(data_bytes: bytes) -> Optional[np.ndarray]:
+def _decode_battery_data(data_bytes: bytes, tag_byte: int) -> Optional[np.ndarray]:
     """
-    Decode Battery data (first 2 bytes = SOC).
+    Decode Battery/status data (TAG 0x88 new firmware, 0x98 legacy).
 
-    Works for both:
-    - 0x98 packets (old firmware): ~20 bytes, battery in first 2 bytes
-    - 0x88 packets (new firmware): 20 bytes, battery in first 2 bytes
+    Both tags carry the same 20-byte body: 10 little-endian 16-bit fields
+    (Samples_10x16bit in the vendor firmware), decoded per BATTERY_CHANNELS.
 
-    Returns: np.ndarray shape (1,) with battery percentage
+    The field identities were fitted on 1,071 real 0x88 status packets
+    (37-minute discharge, 99.9 % → 90.4 %, firmware 3.1.29). The same layout
+    was then verified on the 0x98-tagged capture tests/test_data/
+    data_p1041.txt (same firmware era, 59 packets): percent tracks idx 0,
+    voltage sits at 3844-3886 mV, current is strictly negative while
+    discharging, and the FULL_CAPACITY (idx 2) and BATTERY_AGE (idx 6)
+    constants match the 0x88 fit. Field confidence, mirroring that fit:
+
+    - idx 0 BATTERY_PERCENT: verified (raw / 256.0).
+    - idx 1 REMAINING_CAPACITY / idx 2 FULL_CAPACITY: raw, track SoC; same
+      (unpinned, likely mAh) unit.
+    - idx 3 TIME_TO_EMPTY_INST_RAW: raw; jumpy, inversely proportional to
+      current; probably instantaneous time-to-empty in 5.625 s units but NOT
+      confirmed — exposed raw.
+    - idx 4 TIME_TO_FULL_S: raw * 5.625; 0xFFFF is the "not charging"
+      sentinel and decodes to NaN.
+    - idx 5 CYCLES: raw * 0.01.
+    - idx 6 BATTERY_AGE_RAW: raw (constant 29250 on the test device); vendor
+      enum says "battery age %", probably raw/256 but NOT confirmed — raw.
+    - idx 7 VOLTAGE_MV: raw * 0.078125 (78.125 µV/LSB; 4137 mV at full charge).
+    - idx 8 CURRENT_MA: int16 raw * 0.15625 (156.25 µA/LSB); negative =
+      discharging (−9 mA idle … −69 mA at 16-ch high-power optics).
+    - idx 9 TIME_TO_EMPTY_S: raw * 5.625 (smoothed time-to-empty).
+
+    Returns: np.ndarray shape (1, 10), or None if fewer than 20 bytes.
     """
-    if len(data_bytes) < 2:
+    if len(data_bytes) < 20:
         return None
 
-    raw_soc = struct.unpack("<H", data_bytes[0:2])[0]
-    battery_percent = raw_soc / 256.0
+    raw = np.frombuffer(data_bytes[:20], dtype="<u2", count=10)
+    data = np.empty(10, dtype=np.float32)
+    data[0] = raw[0] / 256.0
+    data[1] = raw[1]  # raw, unit not pinned (likely mAh, same unit as idx 2)
+    data[2] = raw[2]  # raw
+    data[3] = raw[3]  # raw, scaling NOT confirmed
+    # 0xFFFF = "not charging" sentinel → NaN
+    data[4] = raw[4] * 5.625 if raw[4] != 0xFFFF else np.nan
+    data[5] = raw[5] * 0.01
+    data[6] = raw[6]  # raw, scaling NOT confirmed
+    data[7] = raw[7] * 0.078125
+    data[8] = np.frombuffer(data_bytes[16:18], dtype="<i2", count=1)[0] * 0.15625
+    data[9] = raw[9] * 5.625
 
-    return np.array([battery_percent], dtype=np.float32)
+    return data.reshape(1, 10)
 
 
 def _bytes_to_bits(data_bytes: bytes, n_bytes: int) -> List[int]:
@@ -985,7 +1040,9 @@ def decode_rawdata(messages: List[str]) -> Dict[str, pd.DataFrame]:
             n_channels = n_cols - 1
             columns = ["time", *select_optics_channels(n_channels)]
         elif sensor_type == "BATTERY":
-            columns = ["time", "battery_percent"]
+            # Lower-case channel labels; first data column stays exactly
+            # "battery_percent" for backward compatibility.
+            columns = ["time", *(c.lower() for c in BATTERY_CHANNELS)]
         elif sensor_type == "DRL":
             columns = ["time", *DRL_CHANNELS]
         else:

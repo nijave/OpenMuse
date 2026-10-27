@@ -378,7 +378,10 @@ class RealtimeViewer:
                         winsize=1.0
                     )
                     if bat_data.size > 0:
-                        self.battery_level = float(bat_data[0, -1])
+                        # Battery percent is the first channel of the BATTERY
+                        # stream (was the only channel before 0x88 grew to
+                        # 10 status fields).
+                        self.battery_level = float(bat_data[0, 0])
             except:
                 pass
 
