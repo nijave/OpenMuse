@@ -58,10 +58,14 @@ class Preset:
 _A = ATHENA_MODELS  # shorthand for the table below
 
 # Muse S Athena (muse2025) presets. Everything here was confirmed by the
-# firmware 3.1.29 live sweep except p4129, whose sensor set was derived from
-# the captured fixture tests/test_data/data_p4129.txt (EEG8 @ 256 Hz, optics4
-# @ 64 Hz, IMU, DRL/REF, battery @ 1 Hz); its optics power is not visible in
-# packet tags and is inferred as "low" from the README signature table.
+# firmware 3.1.29 live sweep.
+#
+# Note on "p4129": the device's status reply reports the current preset as
+# the hex id printed in decimal ("ps":4129 == 0x1021 == p1021, the power-on
+# default; "ps":4161 == p1041). Sending the literal string "p4129" is
+# rejected by the firmware (rc 69) and leaves the preset unchanged, so the
+# fixture tests/test_data/data_p4129.txt records whatever preset the device
+# already held, not a preset of its own. There is no p4129.
 _ATHENA_ROWS = [
     Preset("p1021", 4, 256, 0, None, True, 32, 1, False, False, _A, ""),
     Preset("p1022", 8, 256, 0, None, False, 32, 1, False, False, _A, ""),
@@ -94,10 +98,6 @@ _ATHENA_ROWS = [
            'Mind Monitor "4L"'),
     Preset("p1046", 8, 256, 4, "high", True, 32, 1, False, False, _A,
            'Mind Monitor "4H"'),
-    Preset("p4129", 8, 256, 4, "low", True, 32, 1, False, False, _A,
-           "device's resident preset after power-on; undocumented; sensor set "
-           "derived from tests/test_data/data_p4129.txt; optics power "
-           "inferred (low) from the README signature table"),
 ]
 
 # Legacy presets accepted by the Athena firmware and by older Muse S / Muse 2.
@@ -139,10 +139,7 @@ PRESETS: Dict[str, Preset] = {
 }
 
 # The Muse S Athena preset set (the p10xx / p102a / p1041-p1046 sweep list).
-# p4129 is also an Athena preset but is not part of the catalogued sweep set.
-ATHENA_PRESETS: tuple[Preset, ...] = tuple(
-    p for p in _ATHENA_ROWS if p.name != "p4129"
-)
+ATHENA_PRESETS: tuple[Preset, ...] = tuple(_ATHENA_ROWS)
 
 ATHENA_PRESET_NAMES = frozenset(p.name for p in ATHENA_PRESETS)
 

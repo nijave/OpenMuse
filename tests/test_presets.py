@@ -25,7 +25,6 @@ class TestAthenaCatalogue(unittest.TestCase):
         "p1025", "p1026", "p1027", "p1028", "p1029", "p102a",
         "p1031", "p1032", "p1033", "p1034", "p1035", "p1036",
         "p1041", "p1042", "p1043", "p1044", "p1045", "p1046",
-        "p4129",
     ]
 
     def test_all_athena_presets_exist(self):
