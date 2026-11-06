@@ -31,6 +31,8 @@ Install from GitHub by opening a terminal and running:
 pip install https://github.com/DominiqueMakowski/OpenMuse/zipball/main
 ```
 
+For headless recording, the light install is enough: `pip install --no-deps <OpenMuse> bleak numpy pandas` lets you `import OpenMuse` and use `record`/`find`/`presets`/`decode_rawdata`. The `stream` and `view` commands need the full install (mne-lsl, vispy, matplotlib).
+
 ## Usage
 
 After installing the package, open a terminal and use the following commands:
