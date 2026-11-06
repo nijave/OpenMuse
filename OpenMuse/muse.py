@@ -165,7 +165,6 @@ class MuseS:
 
         def _on_control(_, data: bytearray):
             nonlocal control_buffer, device_info_logged, found_firmware
-            nonlocal control_buffer, device_info_logged
             try:
                 text = data.decode("utf-8", errors="ignore")
             except Exception:
