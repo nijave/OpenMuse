@@ -160,6 +160,7 @@ from .decode import (
     select_optics_channels,
 )
 from .muse import MuseS
+from .status import StatusWriter, status_path_for_device
 from .utils import configure_lsl_api_cfg, get_utc_timestamp
 
 MAX_BUFFER_PACKETS = 26  # ~100ms capacity for 256Hz
@@ -377,6 +378,10 @@ class StreamDisconnected(Exception):
 # restores the reconnect budget (see _stream_async_with_reconnect).
 _RECONNECT_RESET_SECONDS = 30.0
 
+# Connected but no data received for this long: warn, and report the
+# "stalled" state in the status file.
+_DATA_GAP_SECONDS = 5.0
+
 
 async def _stream_async(
     address: str,
@@ -387,6 +392,7 @@ async def _stream_async(
     clock_model: str = "windowed",
     sensors: Optional[List[str]] = None,
     streams: Optional[Dict[str, SensorStream]] = None,
+    status: Optional[StatusWriter] = None,
 ):
     """Asynchronous context for BLE connection and LSL streaming.
 
@@ -399,6 +405,9 @@ async def _stream_async(
         Pre-existing sensor streams (LSL outlets + clock state) to reuse,
         allowing outlets to survive across reconnect attempts. If None,
         a fresh dict is created and outlets are created lazily on data.
+    status : Optional[StatusWriter]
+        Optional status-file writer; updated on state transitions and
+        periodically while streaming. No effect when None.
 
     Raises
     ------
@@ -469,6 +478,18 @@ async def _stream_async(
 
         # Add to buffer
         stream.buffer.append((lsl_timestamps, samples))
+
+        # Capture the latest battery values for the status file
+        # (column 0 of the BATTERY stream is the percent, the
+        # TIME_TO_EMPTY_S column the estimated time to empty).
+        if sensor_type == "BATTERY" and status is not None:
+            idx_percent = BATTERY_CHANNELS.index("BATTERY_PERCENT")
+            idx_tte = BATTERY_CHANNELS.index("TIME_TO_EMPTY_S")
+            if samples.shape[1] > max(idx_percent, idx_tte):
+                status.update(
+                    battery_percent=float(samples[-1, idx_percent]),
+                    battery_time_to_empty_s=float(samples[-1, idx_tte]),
+                )
 
     def _flush_buffer():
         """Sort and push all buffered samples to LSL."""
@@ -564,6 +585,10 @@ async def _stream_async(
     if verbose:
         print(f"Connecting to {address}...")
 
+    if status is not None:
+        status.update(state="connecting", connected=False)
+        status.write()
+
     async with bleak.BleakClient(address, timeout=15.0) as client:
         if verbose:
             print(f"Connected. Device: {client.name}")
@@ -571,9 +596,19 @@ async def _stream_async(
 
         start_time = time.monotonic()
         data_callbacks = {uuid: _on_data for uuid in MuseS.DATA_CHARACTERISTICS}
-        await MuseS.connect_and_initialize(
+        firmware = await MuseS.connect_and_initialize(
             client, preset, data_callbacks, verbose=verbose
         )
+
+        if status is not None:
+            status.update(
+                state="streaming",
+                connected=True,
+                device_name=client.name,
+                firmware=firmware,
+                connect_count=status.data["connect_count"] + 1,
+            )
+            status.write()
 
         if verbose:
             print("Streaming data... (Press Ctrl+C to stop)")
@@ -586,13 +621,27 @@ async def _stream_async(
             # Check for data timeout (no data received for 5+ seconds)
             if last_data_time > 0:  # Only check after first data received
                 data_gap = time.monotonic() - last_data_time
-                if data_gap > 5.0 and not data_timeout_warned:
+                if data_gap > _DATA_GAP_SECONDS and not data_timeout_warned:
                     if verbose:
                         print(
                             f"[{address}] WARNING: No data received for {data_gap:.1f}s "
                             f"(connection may be stalled)"
                         )
                     data_timeout_warned = True
+
+            # Periodic status update (rate-limited by the writer interval)
+            if status is not None:
+                if last_data_time > 0:
+                    data_gap = time.monotonic() - last_data_time
+                    status.update(last_data_age_s=data_gap)
+                    if data_gap > _DATA_GAP_SECONDS:
+                        state = "stalled"
+                    else:
+                        state = "streaming"
+                else:
+                    state = "streaming"
+                status.update(state=state, connected=True, samples=dict(samples_sent))
+                status.maybe_write()
 
             if duration and elapsed > duration:
                 if verbose:
@@ -631,6 +680,7 @@ async def _stream_async_with_reconnect(
     auto_reconnect: bool = False,
     reconnect_attempts: int = 5,
     reconnect_delay: float = 3.0,
+    status: Optional[StatusWriter] = None,
 ):
     """Run _stream_async once, or retry across BLE link losses if enabled.
 
@@ -645,6 +695,13 @@ async def _stream_async_with_reconnect(
 
     LSL outlets and clock state are reused across reconnect attempts so that
     downstream consumers see one continuous stream.
+
+    If `status` is given, the state machine of the status file is driven here:
+    "connecting" before each attempt, "reconnecting" while waiting to retry,
+    "failed" when the attempt budget is exhausted (or a stream-ending error
+    occurs without reconnect), and "stopped" on a clean end. The per-attempt
+    details (device info, battery, samples, data age) are written by
+    _stream_async itself.
     """
     if not auto_reconnect:
         # Default path: identical to the pre-reconnect behaviour, where a lost
@@ -652,10 +709,23 @@ async def _stream_async_with_reconnect(
         # _stream_async) instead of surfacing as an error.
         try:
             await _stream_async(
-                address, preset, duration, raw_data_file, verbose, clock_model, sensors
+                address,
+                preset,
+                duration,
+                raw_data_file,
+                verbose,
+                clock_model,
+                sensors,
+                status=status,
             )
-        except StreamDisconnected:
-            pass
+            if status is not None:
+                status.update(state="stopped", connected=False)
+                status.write()
+        except StreamDisconnected as e:
+            if status is not None:
+                reason = str(e) or f"{type(e).__name__}: {e}"
+                status.update(state="failed", connected=False, last_error=reason)
+                status.write()
         return
 
     streams: Dict[str, SensorStream] = {}
@@ -667,7 +737,15 @@ async def _stream_async_with_reconnect(
         if duration is not None:
             remaining = duration - (time.monotonic() - stream_start)
             if remaining <= 0:
+                if status is not None:
+                    status.update(state="stopped", connected=False)
+                    status.write()
                 return
+        if status is not None:
+            status.update(
+                state="connecting", connected=False, failed_attempts=failed_attempts
+            )
+            status.write()
         attempt_start = time.monotonic()
         try:
             await _stream_async(
@@ -679,29 +757,50 @@ async def _stream_async_with_reconnect(
                 clock_model,
                 sensors,
                 streams=streams,
+                status=status,
             )
             # Clean end: duration elapsed (or caller cancelled). Never retry.
+            if status is not None:
+                status.update(state="stopped", connected=False)
+                status.write()
             return
         except asyncio.CancelledError:
+            # Caller cancel (e.g. Ctrl+C) is treated as a clean end.
+            if status is not None:
+                status.update(state="stopped", connected=False)
+                status.write()
             raise
         except (StreamDisconnected, BleakError, OSError, asyncio.TimeoutError) as e:
+            reason = str(e) or f"{type(e).__name__}: {e}"
+            if status is not None:
+                status.update(last_error=reason)
             ran = time.monotonic() - attempt_start
             if ran >= _RECONNECT_RESET_SECONDS:
                 # Link was healthy for a substantial stretch: restore budget.
                 failed_attempts = 0
+                attempt_number = 1
             else:
                 failed_attempts += 1
+                attempt_number = failed_attempts
+            if status is not None:
+                status.update(failed_attempts=failed_attempts)
             if failed_attempts >= reconnect_attempts:
+                if status is not None:
+                    status.update(state="failed", connected=False)
+                    status.write()
                 if verbose:
                     print(
-                        f"[{address}] Connection lost ({e}); giving up after "
+                        f"[{address}] Connection lost ({reason}); giving up after "
                         f"{failed_attempts} failed attempt(s)"
                     )
                 raise
+            if status is not None:
+                status.update(state="reconnecting", connected=False)
+                status.write()
             if verbose:
                 print(
-                    f"[{address}] Connection lost ({e}): reconnecting in "
-                    f"{reconnect_delay:.1f}s (attempt {failed_attempts}/"
+                    f"[{address}] Connection lost ({reason}): reconnecting in "
+                    f"{reconnect_delay:.1f}s (attempt {attempt_number}/"
                     f"{reconnect_attempts})"
                 )
             await asyncio.sleep(reconnect_delay)
@@ -718,6 +817,8 @@ def stream(
     auto_reconnect: bool = False,
     reconnect_attempts: int = 5,
     reconnect_delay: float = 3.0,
+    status_file: Optional[str] = None,
+    status_interval: float = 5.0,
 ) -> None:
     """
     Stream decoded EEG and accelerometer/gyroscope data over LSL.
@@ -725,6 +826,8 @@ def stream(
 
     When streaming multiple devices, if `record` is a string (filename), the device address
     will be appended to the filename to avoid collisions.
+    If `status_file` is given, a JSON status file is written for each device (with the
+    address inserted before the extension when streaming multiple devices).
 
     Parameters
     ----------
@@ -740,6 +843,7 @@ def stream(
 
     tasks = []
     file_handles = []
+    status_writers = []
 
     async def run_multistream():
         if verbose:
@@ -747,6 +851,24 @@ def stream(
 
         for addr in addresses:
             raw_data_file = None
+
+            status_writer = None
+            if status_file:
+                # One status file per device; insert the sanitized address
+                # before the extension when streaming multiple devices.
+                status_path = (
+                    status_file
+                    if len(addresses) == 1
+                    else status_path_for_device(status_file, addr)
+                )
+                status_writer = StatusWriter(
+                    status_path,
+                    address=addr,
+                    preset=preset,
+                    interval=status_interval,
+                )
+                status_writers.append(status_writer)
+
             if record:
                 # Generate unique filename for this device
                 # Sanitize address for filename
@@ -771,6 +893,8 @@ def stream(
                     f = open(filename, "w", encoding="utf-8")
                     file_handles.append(f)
                     raw_data_file = f
+                    if status_writer is not None:
+                        status_writer.update(record_file=filename)
                     if verbose:
                         print(f"Recording raw data for {addr} to {filename}")
                 except IOError as e:
@@ -789,21 +913,35 @@ def stream(
                     auto_reconnect=auto_reconnect,
                     reconnect_attempts=reconnect_attempts,
                     reconnect_delay=reconnect_delay,
+                    status=status_writer,
                 )
             )
 
         # Run all streams concurrently
         await asyncio.gather(*tasks, return_exceptions=False)
 
+    def _mark_status_failed(error):
+        reason = str(error) or f"{type(error).__name__}: {error}"
+        for w in status_writers:
+            if w.data["state"] not in ("stopped", "failed"):
+                w.update(state="failed", connected=False, last_error=reason)
+                w.write()
+
     try:
         asyncio.run(run_multistream())
     except KeyboardInterrupt:
         if verbose:
             print("Streaming stopped by user.")
+        for w in status_writers:
+            if w.data["state"] not in ("stopped", "failed"):
+                w.update(state="stopped", connected=False)
+                w.write()
     except BleakError as e:
         print(f"BLEAK Error: {e}")
+        _mark_status_failed(e)
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
+        _mark_status_failed(e)
     finally:
         for f in file_handles:
             try:

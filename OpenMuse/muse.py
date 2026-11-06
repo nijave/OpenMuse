@@ -161,8 +161,10 @@ class MuseS:
         """
         control_buffer = ""
         device_info_logged = False
+        found_firmware: Optional[str] = None
 
         def _on_control(_, data: bytearray):
+            nonlocal control_buffer, device_info_logged, found_firmware
             nonlocal control_buffer, device_info_logged
             try:
                 text = data.decode("utf-8", errors="ignore")
@@ -181,6 +183,7 @@ class MuseS:
                 print(
                     f"Connected to device (firmware {firmware.group(1)}): battery {battery.group(1)}%"
                 )
+                found_firmware = firmware.group(1)
                 device_info_logged = True
 
         # Subscribe to control notifications first
@@ -217,6 +220,8 @@ class MuseS:
 
         if not device_info_logged and verbose:
             print("Warning: Did not receive device info (firmware/battery)")
+
+        return found_firmware
 
     @staticmethod
     async def stop_streaming(client, verbose: bool = False) -> None:

@@ -156,6 +156,21 @@ def main(argv=None):
         default=3.0,
         help="Seconds to wait between reconnect attempts (default: 3.0)",
     )
+    p_stream.add_argument(
+        "--status-file",
+        default=None,
+        metavar="PATH",
+        help="Write a machine-readable JSON status file (process state, connection, "
+        "battery, sample counts) for external dashboards. With multiple devices, "
+        "one file per device is written with the address inserted before the extension.",
+    )
+    p_stream.add_argument(
+        "--status-interval",
+        type=float,
+        default=5.0,
+        help="Minimum seconds between periodic status file updates while running "
+        "(default: 5.0). State transitions are always written immediately.",
+    )
 
     def handle_stream(ns):
         from .stream import stream
@@ -174,6 +189,8 @@ def main(argv=None):
             auto_reconnect=ns.auto_reconnect,
             reconnect_attempts=ns.reconnect_attempts,
             reconnect_delay=ns.reconnect_delay,
+            status_file=ns.status_file,
+            status_interval=ns.status_interval,
         )
         return 0
 

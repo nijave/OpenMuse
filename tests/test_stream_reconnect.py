@@ -6,12 +6,17 @@ a controllable fake clock so "ran for Ns" behaviour can be simulated.
 """
 
 import asyncio
+import contextlib
 import importlib
+import io
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 stream_mod = importlib.import_module("OpenMuse.stream")
 from OpenMuse.cli import main
+from OpenMuse.status import StatusWriter
 from OpenMuse.stream import StreamDisconnected, _stream_async_with_reconnect
 
 
@@ -54,6 +59,7 @@ class ScriptedStream:
         clock_model="windowed",
         sensors=None,
         streams=None,
+        status=None,
     ):
         self.calls.append((duration, streams))
         step = self.script.pop(0)
@@ -64,6 +70,8 @@ class ScriptedStream:
             return
         if step == "cancel":
             raise asyncio.CancelledError()
+        if step == "empty_disconnect":
+            raise StreamDisconnected()  # empty str(e): exercises message fallback
         raise StreamDisconnected("link lost")
 
     @property
@@ -82,6 +90,20 @@ def run_wrapper(fake, **kwargs):
         return asyncio.run(
             _stream_async_with_reconnect("AA:BB", "p1041", **kwargs)
         )
+
+
+class RecordingStatusWriter(StatusWriter):
+    """StatusWriter that snapshots the status dict on every write()."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.written = []
+
+    def write(self):
+        snapshot = dict(self.data)
+        snapshot["samples"] = dict(self.data["samples"])
+        self.written.append(snapshot)
+        super().write()
 
 
 class ReconnectWrapperTests(unittest.TestCase):
@@ -175,6 +197,127 @@ class CliReconnectFlagsTests(unittest.TestCase):
         self.assertFalse(kwargs["auto_reconnect"])
         self.assertEqual(kwargs["reconnect_attempts"], 5)
         self.assertEqual(kwargs["reconnect_delay"], 3.0)
+
+
+class StatusThroughReconnectTests(unittest.TestCase):
+    """The status writer passed through the reconnect wrapper records the
+    full state lifecycle: connecting -> reconnecting/failed/stopped."""
+
+    def _run(self, script, expected_exception=None, **kwargs):
+        clock = FakeClock()
+        fake = ScriptedStream(clock, script)
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = RecordingStatusWriter(
+                os.path.join(tmp, "status.json"), address="AA:BB"
+            )
+            kwargs.setdefault("reconnect_delay", 0)
+            kwargs.setdefault("status", writer)
+            with mock.patch.object(stream_mod, "time", mock.Mock(monotonic=clock)), \
+                    mock.patch.object(stream_mod, "_stream_async", fake):
+                if expected_exception is not None:
+                    with self.assertRaises(expected_exception):
+                        asyncio.run(
+                            _stream_async_with_reconnect("AA:BB", "p1041", **kwargs)
+                        )
+                else:
+                    asyncio.run(
+                        _stream_async_with_reconnect("AA:BB", "p1041", **kwargs)
+                    )
+        return fake, writer
+
+    def test_states_connecting_reconnecting_failed_on_give_up(self):
+        _, writer = self._run(
+            ["disconnected", "disconnected"],
+            expected_exception=StreamDisconnected,
+            auto_reconnect=True,
+            reconnect_attempts=2,
+        )
+        states = [snapshot["state"] for snapshot in writer.written]
+        self.assertEqual(
+            states, ["connecting", "reconnecting", "connecting", "failed"]
+        )
+        final = writer.written[-1]
+        self.assertFalse(final["connected"])
+        self.assertEqual(final["failed_attempts"], 2)
+        self.assertTrue(final["last_error"])
+
+    def test_states_connecting_stopped_on_clean_end(self):
+        _, writer = self._run(["completed"], auto_reconnect=True, reconnect_attempts=5)
+        states = [snapshot["state"] for snapshot in writer.written]
+        self.assertEqual(states, ["connecting", "stopped"])
+        final = writer.written[-1]
+        self.assertIsNone(final["last_error"])
+
+    def test_attempt_number_printed_after_reset(self):
+        clock = FakeClock()
+        fake = ScriptedStream(
+            clock, [(40.0, "disconnected"), "disconnected", "completed"]
+        )
+        buf = io.StringIO()
+        with mock.patch.object(stream_mod, "time", mock.Mock(monotonic=clock)), \
+                mock.patch.object(stream_mod, "_stream_async", fake), \
+                contextlib.redirect_stdout(buf):
+            asyncio.run(
+                _stream_async_with_reconnect(
+                    "AA:BB",
+                    "p1041",
+                    auto_reconnect=True,
+                    reconnect_attempts=5,
+                    reconnect_delay=0,
+                )
+            )
+        output = buf.getvalue()
+        # After a healthy 40 s stretch the counter resets: the upcoming
+        # reconnect is attempt 1, not 0.
+        self.assertIn("attempt 1/5", output)
+        self.assertNotIn("attempt 0/5", output)
+
+    def test_connection_lost_message_on_empty_exception_message(self):
+        clock = FakeClock()
+        fake = ScriptedStream(clock, ["empty_disconnect", "completed"])
+        buf = io.StringIO()
+        with mock.patch.object(stream_mod, "time", mock.Mock(monotonic=clock)), \
+                mock.patch.object(stream_mod, "_stream_async", fake), \
+                contextlib.redirect_stdout(buf):
+            asyncio.run(
+                _stream_async_with_reconnect(
+                    "AA:BB",
+                    "p1041",
+                    auto_reconnect=True,
+                    reconnect_attempts=5,
+                    reconnect_delay=0,
+                )
+            )
+        output = buf.getvalue()
+        self.assertNotIn("Connection lost ()", output)
+        self.assertIn("StreamDisconnected", output)
+
+
+class CliStatusFlagsTests(unittest.TestCase):
+    def test_status_flags_reach_stream(self):
+        with mock.patch.object(stream_mod, "stream") as mock_stream:
+            rc = main(
+                [
+                    "stream",
+                    "--address",
+                    "AA:BB",
+                    "--status-file",
+                    "status.json",
+                    "--status-interval",
+                    "2.5",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        kwargs = mock_stream.call_args.kwargs
+        self.assertEqual(kwargs["status_file"], "status.json")
+        self.assertEqual(kwargs["status_interval"], 2.5)
+
+    def test_status_defaults_when_flags_absent(self):
+        with mock.patch.object(stream_mod, "stream") as mock_stream:
+            main(["stream", "--address", "AA:BB"])
+        kwargs = mock_stream.call_args.kwargs
+        self.assertIsNone(kwargs["status_file"])
+        self.assertEqual(kwargs["status_interval"], 5.0)
 
 
 if __name__ == "__main__":
