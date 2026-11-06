@@ -101,6 +101,38 @@ The following options are available:
 - `--record`: Record raw BLE packets to a file (optional)
 - `--auto-reconnect`: Automatically reconnect and resume streaming if the BLE link drops (recommended for long/overnight recordings); LSL outlets are reused so downstream sees one continuous stream
 - `--reconnect-attempts` / `--reconnect-delay`: Maximum consecutive failed reconnect attempts (default 5) and seconds between attempts (default 3.0); the attempt counter resets after any 30 s of successful streaming
+- `--status-file PATH`: Write a machine-readable JSON status file for external dashboards (process state, connection status, battery, sample counts); with multiple devices, one file per device is written with the address inserted before the extension
+- `--status-interval SECONDS`: Minimum seconds between periodic status file updates while running (default 5.0); state transitions are always written immediately
+
+#### Status file
+
+When `--status-file` is given, `OpenMuse stream` continuously writes a JSON file describing the streaming process, so an external dashboard (or script) can tell whether the process is running, connected to the headband, and still receiving data. The file is written atomically on every state transition and at least every `--status-interval` seconds:
+
+```json
+{
+  "version": 1,
+  "updated": 1762450000.123,
+  "address": "00:55:DA:B9:FA:20",
+  "preset": "p1041",
+  "state": "streaming",
+  "connected": true,
+  "device_name": "Muse-A8A1",
+  "firmware": "10.92.0",
+  "battery_percent": 87.5,
+  "battery_time_to_empty_s": 12600.0,
+  "samples": {"EEG": 256000, "ACCGYRO": 52000, "OPTICS": 64000, "BATTERY": 1000, "DRL": 32000},
+  "last_data_age_s": 0.1,
+  "connected_since": 1762449900.0,
+  "process_started": 1762449890.0,
+  "connect_count": 1,
+  "failed_attempts": 0,
+  "last_error": null,
+  "record_file": null,
+  "record_bytes": null
+}
+```
+
+`state` is one of `connecting` (trying to connect), `streaming` (connected and receiving data), `stalled` (connected but no data for more than 5 s), `reconnecting` (connection lost, retrying), `stopped` (clean exit after the duration elapsed or Ctrl+C), or `failed` (reconnect gave up, or an error ended the stream). Every field is always present; unknown values (e.g. battery before the first BATTERY packet) are `null`.
 
 ### Visualize Live Streams
 
