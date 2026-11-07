@@ -44,6 +44,12 @@ Volume=%h/muse-data:/data:Z
 UserNS=keep-id
 User=%U:%G
 
+# SELinux: container_t may not write the host's system_dbusd_var_run_t
+# socket and no container-selinux boolean covers the system bus, so this
+# container runs unconfined (spc_t). Capabilities stay dropped and the
+# root stays read-only. A udica type is the narrower alternative.
+SecurityLabelDisable=true
+
 ReadOnly=true
 Tmpfs=/tmp
 NoNewPrivileges=true
