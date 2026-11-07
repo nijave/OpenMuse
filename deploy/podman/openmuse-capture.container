@@ -52,6 +52,10 @@ DropCapability=ALL
 [Service]
 Restart=always
 RestartSec=10
+# The first start pulls a ~560 MB image; over the Pine's WiFi that takes
+# longer than the user manager's default start timeout, which then aborts
+# podman mid-pull. Pre-pulling (the Ansible play does) avoids it entirely.
+TimeoutStartSec=900
 
 [Install]
 WantedBy=default.target
