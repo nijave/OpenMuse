@@ -1,0 +1,57 @@
+# Podman quadlet: OpenMuse overnight capture, rootless user unit.
+#
+# Install on the Pine A64:
+#   ~/.config/containers/systemd/openmuse-capture.container
+#   ~/.config/openmuse-capture.env   (mode 0600, see openmuse-capture.env.example)
+#   systemctl --user daemon-reload && systemctl --user start openmuse-capture
+#   sudo loginctl enable-linger "$USER"   (start at boot without a login)
+#
+# This is a user unit (not /etc/containers/systemd/) so that the container
+# runs rootless, the env file with the headband address stays in the owner's
+# home, and `podman auto-update` runs from the user's own timer.
+
+[Unit]
+Description=OpenMuse overnight capture (container)
+
+[Container]
+Image=registry.apps.nickv.me/nijave/openmuse:latest
+AutoUpdate=registry
+ContainerName=openmuse-capture
+
+# MUSE_ADDRESS, MUSE_PRESET, MUSE_ROTATE_AT, ...
+EnvironmentFile=%h/.config/openmuse-capture.env
+
+# Network=host, not pasta: LSL outlet discovery uses UDP multicast, which does
+# not cross the rootless pasta network, and host networking publishes the
+# dashboard port (MUSE_DASHBOARD_PORT, default 8088) on the host directly.
+Network=host
+
+# bleak talks to BlueZ over the system D-Bus. Fedora's BlueZ D-Bus policy
+# allows any user to call the BlueZ interfaces, so the container user (uid
+# 10001 inside the container, an unprivileged host uid in the rootless user
+# namespace) can drive the headband through this socket without extra setup.
+Volume=/run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+
+# Recordings (muse_*.txt) and status.json land here on the host.
+Volume=%h/muse-data:/data:Z
+
+# Run as the host user's own uid, not the image's uid 10001. Two reasons:
+# rootless Podman would otherwise map the host user to container root and
+# 10001 to a subordinate uid that cannot write ~/muse-data; and D-Bus
+# EXTERNAL authentication compares the uid the process claims with the uid
+# the bus sees on the socket, which only match when they are the same
+# number (a remapped uid gets "authentication failed: REJECTED").
+UserNS=keep-id
+User=%U:%G
+
+ReadOnly=true
+Tmpfs=/tmp
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
