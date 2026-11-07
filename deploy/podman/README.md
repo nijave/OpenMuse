@@ -21,7 +21,11 @@ supervisor that:
 * `Containerfile` — `python:3.12.16-slim-trixie`, installs the repo with
   `pip install --no-deps` plus `bleak`, `numpy`, `pandas`, `mne-lsl==1.9.0`.
   Runs as the non-root user `openmuse` (UID 10001).
-* `dashboard.py` — supervisor + status dashboard (stdlib only).
+* `dashboard.py` — supervisor + status dashboard (stdlib only); after each
+  rotation (and at startup, for leftovers from a previous run) it compresses
+  finished record files in place with `zstd`, so an overnight capture ends up
+  as `muse_*.txt.zst` (roughly 2.5x smaller; the live file stays uncompressed
+  for crash safety).
 * `build.sh` — multi-arch build (`linux/amd64` + `linux/arm64`) into one
   manifest list. Build context is the repo root.
 * `openmuse-capture.container` — the quadlet (user unit).
@@ -43,6 +47,15 @@ supervisor that:
 | `MUSE_RECONNECT_DELAY` | `10` | seconds between stream reconnects |
 | `MUSE_RECONNECT_ATTEMPTS` | `1000000` | stream reconnect attempts |
 | `MUSE_EXTRA_ARGS` | empty | extra `OpenMuse stream` args (shlex-split) |
+| `MUSE_COMPRESS` | `zstd` | compressor used for finished record files; empty or `none` disables compression |
+| `MUSE_COMPRESS_LEVEL` | `3` | zstd compression level (1–19) |
+
+Finished (rotated or leftover) `muse_*.txt` recordings are compressed to
+`muse_*.txt.zst` a minute or so after the child stops writing them; the file
+the live child is writing is never touched. Compression activity shows on the
+dashboard page and under `supervisor` in `/status.json` (`compressing` and
+`compress`). Read the `.zst` files back with
+`OpenMuse.read_rawdata_lines("muse_....txt.zst")`.
 
 ## The mne-lsl 1.9.0 pin
 

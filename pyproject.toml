@@ -23,6 +23,11 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 
+[project.optional-dependencies]
+# Optional zstd support for reading finished compressed recordings
+# (OpenMuse.read_rawdata_lines); without it the zstd CLI is used as fallback.
+zstd = ["zstandard>=0.22"]
+
 [project.scripts]
 OpenMuse = "OpenMuse.cli:main"
 

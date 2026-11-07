@@ -102,6 +102,11 @@ class Config:
         self.reconnect_delay = int(env.get("MUSE_RECONNECT_DELAY", "10"))
         self.reconnect_attempts = int(env.get("MUSE_RECONNECT_ATTEMPTS", "1000000"))
         self.extra_args = shlex.split(env.get("MUSE_EXTRA_ARGS", ""))
+        # Compress finished record files with this tool (""/"none" disables).
+        compress = env.get("MUSE_COMPRESS", "zstd").strip()
+        self.compress = compress.lower() if compress.lower() not in ("", "none") \
+            else None
+        self.compress_level = int(env.get("MUSE_COMPRESS_LEVEL", "3"))
 
     def command(self, record_file: Path) -> list[str]:
         return [
@@ -117,6 +122,13 @@ class Config:
             *self.extra_args,
         ]
 
+    def compress_command(self, record_file: Path) -> list[str] | None:
+        """zstd command that compresses a finished file in place, or None."""
+        if self.compress is None:
+            return None
+        return [self.compress, "-q", "-T1", f"-{self.compress_level}",
+                "--rm", str(record_file)]
+
 
 # --------------------------------------------------------------------------
 # Supervisor
@@ -125,12 +137,23 @@ class Config:
 class Supervisor:
     """Owns the stream child process; shared with the HTTP thread."""
 
+    # Files modified more recently than this may still be written by a
+    # just-stopped child; leave them for a later scan.
+    COMPRESS_MIN_AGE_S = 60
+    # How often the supervisor rescans for compressible leftovers.
+    COMPRESS_SCAN_INTERVAL_S = 60
+
     def __init__(self, config: Config):
         self.config = config
         self.child: subprocess.Popen | None = None  # or a test double
+        self.record_file: Path | None = None  # file the child writes to
         self.stop_requested = False
         self.started = time.time()
         self.rotations = 0
+        # Running compressor subprocesses, keyed by record file name.
+        self.compressors: dict[str, subprocess.Popen] = {}
+        # Injectable for tests; real value spawns the compressor process.
+        self._popen = subprocess.Popen
 
     # -- child ----------------------------------------------------------
 
@@ -141,11 +164,129 @@ class Supervisor:
         except Exception:
             return False
 
-    def start_child(self) -> None:
-        record = self.config.data_dir / f"muse_{datetime.now():%Y-%m-%d_%H%M}.txt"
+    def next_record_file(self) -> Path:
+        return self.config.data_dir / f"muse_{datetime.now():%Y-%m-%d_%H%M}.txt"
+
+    def start_child(self, record: Path | None = None) -> None:
+        record = self.next_record_file() if record is None else record
+        self.record_file = record
         cmd = self.config.command(record)
         log(f"starting: {shlex.join(cmd)}")
         self.child = subprocess.Popen(cmd)
+
+    # -- compression of finished record files ---------------------------
+
+    def compress_candidates(self, exclude: Path | None = None,
+                            now: float | None = None) -> list[Path]:
+        """Finished muse_*.txt files that are safe to compress now.
+
+        Skips the file the live child writes (``exclude``), files modified
+        in the last COMPRESS_MIN_AGE_S seconds, files that already have a
+        ``.zst`` twin, and files already being compressed.
+        """
+        if self.config.compress is None:
+            return []
+        now = time.time() if now is None else now
+        exclude = exclude.resolve() if exclude is not None else None
+        out: list[Path] = []
+        try:
+            entries = sorted(self.config.data_dir.glob("muse_*.txt"))
+        except OSError:
+            return []
+        for path in entries:
+            if exclude is not None:
+                try:
+                    if path.resolve() == exclude:
+                        continue
+                except OSError:
+                    continue
+            if path.name in self.compressors:
+                continue
+            twin = path.with_name(path.name + ".zst")
+            if twin.exists():
+                continue
+            try:
+                if now - path.stat().st_mtime < self.COMPRESS_MIN_AGE_S:
+                    continue
+            except OSError:
+                continue
+            out.append(path)
+        return out
+
+    def start_compression(self, path: Path) -> bool:
+        """Start one background zstd run; never raises, only logs."""
+        cmd = self.config.compress_command(path)
+        if cmd is None:
+            return False
+        log(f"compressing: start {shlex.join(cmd)}")
+        try:
+            proc = self._popen(cmd)
+        except OSError as exc:
+            log(f"compressing: failed to start {path.name}: {exc}")
+            return False
+        self.compressors[path.name] = proc
+        return True
+
+    def compress_scan(self, exclude: Path | None = None,
+                      now: float | None = None) -> int:
+        """Compress every currently compressible leftover; returns count."""
+        candidates = self.compress_candidates(exclude=exclude, now=now)
+        return sum(1 for path in candidates if self.start_compression(path))
+
+    def reap_compressors(self) -> None:
+        """Log and forget finished compressor subprocesses."""
+        for name, proc in list(self.compressors.items()):
+            code = proc.poll()
+            if code is None:
+                continue
+            del self.compressors[name]
+            if code == 0:
+                log(f"compressing: finished {name}")
+            else:
+                log(f"compressing: failed {name} (exit code {code})")
+
+    def compressing(self) -> list[str]:
+        return sorted(self.compressors)
+
+    def rotate(self) -> None:
+        log("rotation time reached; restarting the stream with a new record file")
+        self.rotations += 1
+        self.stop_child()
+        record = self.next_record_file()
+        self.compress_scan(exclude=record)
+        self.start_child(record)
+
+    def run(self) -> int:
+        """Main loop; returns the supervisor (and process) exit code."""
+        record = self.next_record_file()
+        # Compress leftovers from a previous run, but never the file the
+        # new child is about to write.
+        self.compress_scan(exclude=record)
+        self.start_child(record)
+        next_rotate = next_rotation_ts(self.config.rotate_at)
+        last_scan = time.time()
+        while not self.stop_requested:
+            if next_rotate is not None and time.time() >= next_rotate:
+                self.rotate()
+                next_rotate = next_rotation_ts(self.config.rotate_at)
+                last_scan = time.time()
+            elif not self.child_alive:
+                code = self.child.returncode if self.child is not None else -1
+                log(f"stream child exited with code {code}; supervisor exits "
+                    f"(systemd Restart= handles retries)")
+                return code
+            self.reap_compressors()
+            if time.time() - last_scan >= self.COMPRESS_SCAN_INTERVAL_S:
+                self.compress_scan(exclude=self.record_file)
+                last_scan = time.time()
+            time.sleep(1.0)
+        # SIGTERM/SIGINT was forwarded by the handler; give the child time.
+        if self.child is not None and self.child.poll() is None:
+            try:
+                self.child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self._signal_child(self.child, signal.SIGKILL)
+        return 0
 
     def stop_child(self, grace_s: int = 30) -> None:
         """SIGINT, wait, escalate to SIGTERM and SIGKILL if needed."""
@@ -235,6 +376,8 @@ class Supervisor:
             "status_age_s": round(age, 1) if age is not None else None,
             "rotate_at": self.config.rotate_display,
             "data_dir": str(self.config.data_dir),
+            "compress": self.config.compress,
+            "compressing": self.compressing(),
         }
 
 
@@ -335,6 +478,7 @@ PAGE = """<!doctype html>
 <p><span class="badge {color}">{state}</span></p>
 <p class="muted">supervisor up {uptime} &middot; child pid {child_pid}
 ({child_state}) &middot; status.json {status_age}{stale}</p>
+{compressing_html}
 <table>
 <tr><th>field</th><th>value</th></tr>
 {rows}
@@ -398,6 +542,11 @@ def render_index(sup: Supervisor) -> str:
 
     uptime = fmt_seconds(round(time.time() - sup.started))
     child_pid = sup.child.pid if sup.child is not None else None
+    running = sup.compressing()
+    compressing_html = \
+        f'<p class="muted">compressing: {html.escape(", ".join(running))}</p>' \
+        if running else ""
+
     return PAGE.format(
         state=html.escape(state),
         color=color,
@@ -406,6 +555,7 @@ def render_index(sup: Supervisor) -> str:
         child_state="alive" if sup.child_alive else "dead",
         status_age=status_age,
         stale=stale,
+        compressing_html=compressing_html,
         rows=rows_html,
         data_dir=html.escape(str(sup.config.data_dir)),
         files=files_html,

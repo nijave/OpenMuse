@@ -69,6 +69,9 @@ import OpenMuse
 
 with open("data.txt", "r", encoding="utf-8") as f:
     messages = f.readlines()
+# or, for plain/.gz/.zst files (e.g. muse_*.txt.zst written by the
+# deploy/podman capture container):
+messages = OpenMuse.read_rawdata_lines("data.txt.zst")
 data = OpenMuse.decode_rawdata(messages)
 
 # Plot Movement Data
@@ -80,6 +83,11 @@ data["ACCGYRO"].plot(
 ```
 
 ![](./media/example_accgyro.png)
+
+> [!NOTE]
+> Reading `.zst` recordings needs the optional `zstandard` package
+> (`pip install OpenMuse[zstd]`) or the `zstd` command-line binary on PATH;
+> plain and `.gz` files always work.
 
 ### Lab Streaming Layer (LSL)
 

@@ -16,6 +16,7 @@ from .decode import decode_rawdata, parse_message
 from .muse import find_muse
 from .muse import MuseS
 from .presets import PRESETS, describe_preset, preset_for_sensors
+from .rawio import read_rawdata_lines
 from .record import record
 
 __version__ = "0.1.9"
@@ -38,6 +39,7 @@ __all__ = [
     "PRESETS",
     "describe_preset",
     "preset_for_sensors",
+    "read_rawdata_lines",
     "record",
     # lazy (heavy dependencies: mne-lsl, vispy, matplotlib)
     "stream",
