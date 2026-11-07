@@ -36,6 +36,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY . /src
 
+# zstd is used by dashboard.py to compress finished record files in place.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zstd \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-deps /src \
  && pip install "bleak>=0.21.0" "numpy==2.2.6" "pandas==2.3.3" "mne-lsl==1.9.0" \
  && useradd --uid 10001 --user-group --no-create-home \
