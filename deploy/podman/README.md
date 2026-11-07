@@ -19,13 +19,20 @@ supervisor that:
 ## Files
 
 * `Containerfile` — `python:3.12.16-slim-trixie`, installs the repo with
-  `pip install --no-deps` plus `bleak`, `numpy`, `pandas`, `mne-lsl==1.9.0`.
-  Runs as the non-root user `openmuse` (UID 10001).
+  `pip install --no-deps` plus `bleak`, `numpy`, `pandas`, `mne-lsl==1.9.0`,
+  `paho-mqtt`. Runs as the non-root user `openmuse` (UID 10001).
 * `dashboard.py` — supervisor + status dashboard (stdlib only); after each
   rotation (and at startup, for leftovers from a previous run) it compresses
   finished record files in place with `zstd`, so an overnight capture ends up
   as `muse_*.txt.zst` (roughly 2.5x smaller; the live file stays uncompressed
   for crash safety).
+* `ha_mqtt.py` — optional Home Assistant MQTT discovery publisher (see
+  "Home Assistant over MQTT" below); imported by `dashboard.py` only at
+  runtime, and `paho-mqtt` itself is imported only when `MUSE_MQTT_HOST` is
+  set, so the dashboard still runs without both.
+* `test_dashboard.py`, `test_ha_mqtt.py` — unit tests (stdlib `unittest`, no
+  broker, no headband): `python3 -m unittest deploy/podman/test_ha_mqtt.py
+  deploy/podman/test_dashboard.py` from the repo root.
 * `build.sh` — multi-arch build (`linux/amd64` + `linux/arm64`) into one
   manifest list. Build context is the repo root.
 * `openmuse-capture.container` — the quadlet (user unit).
@@ -49,6 +56,13 @@ supervisor that:
 | `MUSE_EXTRA_ARGS` | empty | extra `OpenMuse stream` args (shlex-split) |
 | `MUSE_COMPRESS` | `zstd` | compressor used for finished record files; empty or `none` disables compression |
 | `MUSE_COMPRESS_LEVEL` | `3` | zstd compression level (1–19) |
+| `MUSE_MQTT_HOST` | empty | MQTT broker host; empty (default) disables MQTT entirely |
+| `MUSE_MQTT_PORT` | `1883` | MQTT broker port |
+| `MUSE_MQTT_USER` | empty | MQTT username (optional) |
+| `MUSE_MQTT_PASSWORD` | empty | MQTT password |
+| `MUSE_MQTT_PREFIX` | `openmuse` | MQTT topic prefix, topics are `<prefix>/<device-id>/...` |
+| `MUSE_HA_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant MQTT discovery prefix |
+| `MUSE_MQTT_INTERVAL` | `10` | seconds between MQTT state publications (changes publish immediately) |
 
 Finished (rotated or leftover) `muse_*.txt` recordings are compressed to
 `muse_*.txt.zst` a minute or so after the child stops writing them; the file
@@ -56,6 +70,51 @@ the live child is writing is never touched. Compression activity shows on the
 dashboard page and under `supervisor` in `/status.json` (`compressing` and
 `compress`). Read the `.zst` files back with
 `OpenMuse.read_rawdata_lines("muse_....txt.zst")`.
+
+## Home Assistant over MQTT
+
+Set `MUSE_MQTT_HOST` (and credentials if the broker needs them) to expose the
+capture to Home Assistant through its MQTT discovery integration — the
+headband appears as one device ("Muse S Athena <last 4 MAC octets>",
+manufacturer Interaxon) with these entities:
+
+| Entity | Component | Device class | Unit | Source |
+|---|---|---|---|---|
+| Capture state | `sensor` | `enum` (7 states + unknown) | – | `status.json` `state` (or `not-running` when the child is dead) |
+| Headband connected | `binary_sensor` | `connectivity` | – | `status.json` `connected` |
+| Battery | `sensor` | `battery` | % | `battery_percent` |
+| Battery time to empty | `sensor` | `duration` | s | `battery_time_to_empty_s` |
+| Seconds since last packet | `sensor` | `duration` | s | `last_data_age_s` (diagnostic) |
+| EEG samples | `sensor` | – | samples | `samples.EEG`, cumulative per process (diagnostic) |
+| Recording size | `sensor` | `data_size` | B | `record_bytes` (diagnostic; HA converts to KB/MB/GB) |
+
+The state sensor additionally carries `samples` (all sensor counters),
+`record_file`, `firmware`, `device_name`, `last_error`, `connect_count` and
+`failed_attempts` as JSON attributes, so per-stream counters and errors don't
+need their own entities.
+
+Implementation notes:
+
+* All values travel in **one** retained JSON document on
+  `<prefix>/<device-id>/state`; each entity reads its key with a
+  `value_template`. Null values are omitted and templates fall back to
+  `unknown`, so a headband without battery info shows "unknown" rather than
+  an error.
+* Availability is `<prefix>/<device-id>/availability`: retained `online` on
+  connect, retained `offline` on clean shutdown, and an LWT publishes
+  `offline` if the container dies without disconnecting.
+* State is published at most every `MUSE_MQTT_INTERVAL` seconds (default 10)
+  and immediately whenever `state` or `connected` changes.
+* Discovery configs are retained, republished when Home Assistant restarts
+  (`homeassistant/status` → `online`) and when the firmware version becomes
+  known (it lands in the device's `sw_version`).
+* MQTT problems never take the supervisor down: connect failures are handled
+  by paho's automatic reconnect, publish ticks are skipped while offline, and
+  if `paho-mqtt` is not installed the error is logged once and the capture
+  continues without MQTT.
+* The dashboard page shows `mqtt: connected to <host>:<port>` / `mqtt:
+  connecting to ...` / `mqtt: disabled`; the same line is in the `supervisor`
+  object of `/status.json`.
 
 ## The mne-lsl 1.9.0 pin
 

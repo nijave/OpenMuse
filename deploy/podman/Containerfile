@@ -43,12 +43,14 @@ RUN apt-get update \
 
 RUN pip install --no-deps /src \
  && pip install "bleak>=0.21.0" "numpy==2.2.6" "pandas==2.3.3" "mne-lsl==1.9.0" \
+              "paho-mqtt>=2.0,<3" \
  && useradd --uid 10001 --user-group --no-create-home \
         --home-dir /nonexistent --shell /usr/sbin/nologin openmuse \
  && mkdir -p /data \
  && chown 10001:10001 /data
 
 COPY --chmod=0644 deploy/podman/dashboard.py /app/dashboard.py
+COPY --chmod=0644 deploy/podman/ha_mqtt.py /app/ha_mqtt.py
 
 USER 10001:10001
 WORKDIR /app
