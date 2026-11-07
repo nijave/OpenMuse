@@ -1,0 +1,12 @@
+# Build context for the openmuse-capture image (used with
+# `podman build -f deploy/podman/Containerfile .` from the repo root).
+# The repo is copied into /src and installed with `pip install --no-deps`,
+# so keep the image lean: no VCS, secrets, tests, media or captured data.
+.git
+.gitignore
+secret/
+tests/
+validation/
+media/
+old/
+*.txt

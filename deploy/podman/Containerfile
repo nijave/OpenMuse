@@ -1,0 +1,51 @@
+# OpenMuse overnight capture (dashboard.py supervising `OpenMuse stream`)
+# as an OCI image.
+#
+# Build both architectures with deploy/podman/build.sh. Single-arch local
+# build from the repo root:
+#   podman build -t openmuse-capture:dev -f deploy/podman/Containerfile .
+#
+# The repo is copied (see .containerignore) and installed with --no-deps;
+# only the runtime dependencies of `OpenMuse stream` are added below.
+# vispy/matplotlib (needed only by `OpenMuse view`) are not installed.
+#
+# mne-lsl is pinned to 1.9.0: 1.10+ ships no manylinux aarch64 wheel, while
+# 1.9.0 does and bundles liblsl. OpenMuse only uses StreamInfo/StreamOutlet/
+# local_clock, which all exist in 1.9.0. numpy/pandas are pinned to versions
+# with manylinux aarch64 wheels for CPython 3.12.
+#
+# Only the repo itself is installed with --no-deps. The explicit dependencies
+# are installed WITH their dependencies: mne-lsl 1.9.0 imports mne, scipy,
+# matplotlib, pooch, ... at package import time, so they are all needed even
+# though OpenMuse itself only touches the LSL stream classes.
+
+FROM docker.io/library/python:3.12.16-slim-trixie
+
+ARG VERSION=dev
+
+LABEL org.opencontainers.image.title="openmuse-capture" \
+      org.opencontainers.image.description="Overnight Muse S Athena capture: OpenMuse stream under a supervisor with an HTTP status dashboard" \
+      org.opencontainers.image.source="https://registry.apps.nickv.me/nijave/openmuse" \
+      org.opencontainers.image.version="${VERSION}"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+COPY . /src
+
+RUN pip install --no-deps /src \
+ && pip install "bleak>=0.21.0" "numpy==2.2.6" "pandas==2.3.3" "mne-lsl==1.9.0" \
+ && useradd --uid 10001 --user-group --no-create-home \
+        --home-dir /nonexistent --shell /usr/sbin/nologin openmuse \
+ && mkdir -p /data \
+ && chown 10001:10001 /data
+
+COPY --chmod=0644 deploy/podman/dashboard.py /app/dashboard.py
+
+USER 10001:10001
+WORKDIR /app
+
+ENTRYPOINT ["python", "/app/dashboard.py"]
