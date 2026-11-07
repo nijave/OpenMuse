@@ -107,6 +107,8 @@ class Config:
         self.compress = compress.lower() if compress.lower() not in ("", "none") \
             else None
         self.compress_level = int(env.get("MUSE_COMPRESS_LEVEL", "3"))
+        # Optional Home Assistant MQTT discovery publisher (ha_mqtt.py).
+        self.mqtt = MqttSettings(env)
 
     def command(self, record_file: Path) -> list[str]:
         return [
@@ -128,6 +130,24 @@ class Config:
             return None
         return [self.compress, "-q", "-T1", f"-{self.compress_level}",
                 "--rm", str(record_file)]
+
+
+class MqttSettings:
+    """Home Assistant MQTT knobs, all optional. Empty MUSE_MQTT_HOST (the
+    default) disables MQTT entirely. Parsed here so dashboard.py stays
+    standalone; ha_mqtt.py only receives the values."""
+
+    def __init__(self, env: dict[str, str]):
+        self.host = env.get("MUSE_MQTT_HOST", "").strip()
+        self.port = int(env.get("MUSE_MQTT_PORT", "1883"))
+        self.user = env.get("MUSE_MQTT_USER", "")
+        self.password = env.get("MUSE_MQTT_PASSWORD", "")
+        self.prefix = env.get("MUSE_MQTT_PREFIX", "openmuse").strip() \
+            or "openmuse"
+        self.discovery_prefix = env.get("MUSE_HA_DISCOVERY_PREFIX",
+                                        "homeassistant").strip() \
+            or "homeassistant"
+        self.interval = int(env.get("MUSE_MQTT_INTERVAL", "10"))
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +174,8 @@ class Supervisor:
         self.compressors: dict[str, subprocess.Popen] = {}
         # Injectable for tests; real value spawns the compressor process.
         self._popen = subprocess.Popen
+        # Optional HaMqttPublisher (set by main()); None in tests.
+        self.mqtt = None
 
     # -- child ----------------------------------------------------------
 
@@ -266,6 +288,7 @@ class Supervisor:
         next_rotate = next_rotation_ts(self.config.rotate_at)
         last_scan = time.time()
         while not self.stop_requested:
+            self.publish_mqtt()
             if next_rotate is not None and time.time() >= next_rotate:
                 self.rotate()
                 next_rotate = next_rotation_ts(self.config.rotate_at)
@@ -274,6 +297,7 @@ class Supervisor:
                 code = self.child.returncode if self.child is not None else -1
                 log(f"stream child exited with code {code}; supervisor exits "
                     f"(systemd Restart= handles retries)")
+                self.publish_mqtt()  # flips the MQTT state to 'not-running'
                 return code
             self.reap_compressors()
             if time.time() - last_scan >= self.COMPRESS_SCAN_INTERVAL_S:
@@ -286,6 +310,7 @@ class Supervisor:
                 self.child.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 self._signal_child(self.child, signal.SIGKILL)
+        self.publish_mqtt()
         return 0
 
     def stop_child(self, grace_s: int = 30) -> None:
@@ -320,33 +345,22 @@ class Supervisor:
         except ProcessLookupError:
             pass
 
-    def rotate(self) -> None:
-        log("rotation time reached; restarting the stream with a new record file")
-        self.rotations += 1
-        self.stop_child()
-        self.start_child()
+    # -- MQTT (optional; the publisher lives in ha_mqtt.py) ----------------
 
-    def run(self) -> int:
-        """Main loop; returns the supervisor (and process) exit code."""
-        self.start_child()
-        next_rotate = next_rotation_ts(self.config.rotate_at)
-        while not self.stop_requested:
-            if next_rotate is not None and time.time() >= next_rotate:
-                self.rotate()
-                next_rotate = next_rotation_ts(self.config.rotate_at)
-            elif not self.child_alive:
-                code = self.child.returncode if self.child is not None else -1
-                log(f"stream child exited with code {code}; supervisor exits "
-                    f"(systemd Restart= handles retries)")
-                return code
-            time.sleep(1.0)
-        # SIGTERM/SIGINT was forwarded by the handler; give the child time.
-        if self.child is not None and self.child.poll() is None:
-            try:
-                self.child.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self._signal_child(self.child, signal.SIGKILL)
-        return 0
+    def mqtt_status(self) -> str:
+        """'mqtt: ...' line shown on the dashboard and in /status.json."""
+        return self.mqtt.status_line() if self.mqtt is not None \
+            else "mqtt: disabled"
+
+    def publish_mqtt(self) -> None:
+        """One MQTT publication tick; never raises."""
+        if self.mqtt is None or not self.mqtt.enabled:
+            return
+        try:
+            status, _ = self.status()
+            self.mqtt.publish(status, self.supervisor_info())
+        except Exception as exc:
+            log(f"mqtt: publish failed: {exc}")
 
     # -- status ----------------------------------------------------------
 
@@ -378,6 +392,7 @@ class Supervisor:
             "data_dir": str(self.config.data_dir),
             "compress": self.config.compress,
             "compressing": self.compressing(),
+            "mqtt": self.mqtt_status(),
         }
 
 
@@ -477,7 +492,8 @@ PAGE = """<!doctype html>
 <h1>OpenMuse capture</h1>
 <p><span class="badge {color}">{state}</span></p>
 <p class="muted">supervisor up {uptime} &middot; child pid {child_pid}
-({child_state}) &middot; status.json {status_age}{stale}</p>
+({child_state}) &middot; status.json {status_age}{stale} &middot;
+{mqtt_line}</p>
 {compressing_html}
 <table>
 <tr><th>field</th><th>value</th></tr>
@@ -555,6 +571,7 @@ def render_index(sup: Supervisor) -> str:
         child_state="alive" if sup.child_alive else "dead",
         status_age=status_age,
         stale=stale,
+        mqtt_line=html.escape(sup.mqtt_status()),
         compressing_html=compressing_html,
         rows=rows_html,
         data_dir=html.escape(str(sup.config.data_dir)),
@@ -620,6 +637,24 @@ def make_server(sup: Supervisor, bind: str | None = None,
 # Entry point
 # --------------------------------------------------------------------------
 
+def make_publisher(config: Config):
+    """Optional HA MQTT publisher; None when the module or host is missing.
+    ha_mqtt.py itself imports paho lazily, so this never pulls it in unless
+    MUSE_MQTT_HOST is set."""
+    try:
+        import ha_mqtt
+    except ImportError:
+        if config.mqtt.host:
+            log("ha_mqtt.py not available; running without MQTT")
+        return None
+    m = config.mqtt
+    return ha_mqtt.HaMqttPublisher(
+        host=m.host, port=m.port, user=m.user, password=m.password,
+        prefix=m.prefix, discovery_prefix=m.discovery_prefix,
+        interval=m.interval, address=config.address,
+    )
+
+
 def main() -> int:
     config = Config()
     try:
@@ -627,6 +662,12 @@ def main() -> int:
     except OSError as exc:
         log(f"cannot create data dir {config.data_dir}: {exc}")
     sup = Supervisor(config)
+
+    publisher = make_publisher(config)
+    if publisher is not None:
+        sup.mqtt = publisher
+        publisher.start()
+        log(publisher.status_line())
 
     server = make_server(sup)
     threading.Thread(target=server.serve_forever, name="dashboard-http",
@@ -649,6 +690,9 @@ def main() -> int:
     try:
         code = sup.run()
     finally:
+        if publisher is not None:
+            # Clean stop: retained 'offline' availability, then disconnect.
+            publisher.stop()
         server.shutdown()
     return code
 

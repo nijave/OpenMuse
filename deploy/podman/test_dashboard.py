@@ -449,5 +449,120 @@ class RotationParsingTests(unittest.TestCase):
         self.assertEqual(cmd[-2:], ["--preset-extra", "foo"])
 
 
+class ConfigMQTTTests(unittest.TestCase):
+    def test_defaults_disabled(self):
+        config = dashboard.Config({
+            "MUSE_ADDRESS": "00:55:DA:00:00:00",
+            "MUSE_DATA_DIR": "/data",
+        })
+        self.assertEqual(config.mqtt.host, "")
+        self.assertEqual(config.mqtt.port, 1883)
+        self.assertEqual(config.mqtt.user, "")
+        self.assertEqual(config.mqtt.password, "")
+        self.assertEqual(config.mqtt.prefix, "openmuse")
+        self.assertEqual(config.mqtt.discovery_prefix, "homeassistant")
+        self.assertEqual(config.mqtt.interval, 10)
+
+    def test_overrides(self):
+        config = dashboard.Config({
+            "MUSE_ADDRESS": "00:55:DA:00:00:00",
+            "MUSE_MQTT_HOST": "ha.local",
+            "MUSE_MQTT_PORT": "8883",
+            "MUSE_MQTT_USER": "mqtt-user",
+            "MUSE_MQTT_PASSWORD": "mqtt-pass",
+            "MUSE_MQTT_PREFIX": "muse",
+            "MUSE_HA_DISCOVERY_PREFIX": "ha",
+            "MUSE_MQTT_INTERVAL": "30",
+        })
+        self.assertEqual(config.mqtt.host, "ha.local")
+        self.assertEqual(config.mqtt.port, 8883)
+        self.assertEqual(config.mqtt.user, "mqtt-user")
+        self.assertEqual(config.mqtt.password, "mqtt-pass")
+        self.assertEqual(config.mqtt.prefix, "muse")
+        self.assertEqual(config.mqtt.discovery_prefix, "ha")
+        self.assertEqual(config.mqtt.interval, 30)
+
+
+class SupervisorMqttTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data_dir = Path(self.tmp.name)
+        (self.data_dir / "status.json").write_text(json.dumps(FRESH_STATUS))
+
+    def test_status_line_disabled_without_publisher(self):
+        sup = make_supervisor(self.data_dir)
+        self.assertEqual(sup.mqtt_status(), "mqtt: disabled")
+
+    def test_status_line_from_publisher(self):
+        sup = make_supervisor(self.data_dir)
+        sup.mqtt = SimpleNamespace(
+            enabled=True,
+            status_line=lambda: "mqtt: connected to ha.local:1883",
+            publish=lambda status, sup_info: None,
+        )
+        self.assertEqual(sup.mqtt_status(), "mqtt: connected to ha.local:1883")
+
+    def test_publish_mqtt_forwards_status_and_supervisor_info(self):
+        calls = []
+        sup = make_supervisor(self.data_dir)
+        sup.mqtt = SimpleNamespace(
+            enabled=True,
+            status_line=lambda: "mqtt: connected to ha.local:1883",
+            publish=lambda status, sup_info: calls.append((status, sup_info)),
+        )
+        sup.publish_mqtt()
+        self.assertEqual(len(calls), 1)
+        status, sup_info = calls[0]
+        self.assertEqual(status["state"], "streaming")
+        self.assertEqual(sup_info["mqtt"], "mqtt: connected to ha.local:1883")
+
+    def test_publish_mqtt_skipped_when_disabled(self):
+        calls = []
+        sup = make_supervisor(self.data_dir)
+        sup.mqtt = SimpleNamespace(
+            enabled=False,
+            status_line=lambda: "mqtt: disabled",
+            publish=lambda status, sup_info: calls.append(status),
+        )
+        sup.publish_mqtt()
+        self.assertEqual(calls, [])
+
+    def test_publish_mqtt_error_is_logged_not_raised(self):
+        def boom(status, sup_info):
+            raise RuntimeError("broker gone")
+        sup = make_supervisor(self.data_dir)
+        sup.mqtt = SimpleNamespace(enabled=True,
+                                   status_line=lambda: "mqtt: connecting",
+                                   publish=boom)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            sup.publish_mqtt()  # must not raise
+        self.assertIn("mqtt: publish failed", captured.getvalue())
+
+
+    def test_status_json_supervisor_includes_mqtt(self):
+        sup = make_supervisor(self.data_dir)
+        self.assertEqual(sup.supervisor_info()["mqtt"], "mqtt: disabled")
+        sup.mqtt = SimpleNamespace(
+            enabled=True,
+            status_line=lambda: "mqtt: connecting to ha.local:1883",
+            publish=lambda status, sup_info: None,
+        )
+        self.assertEqual(sup.supervisor_info()["mqtt"],
+                         "mqtt: connecting to ha.local:1883")
+
+    def test_index_page_shows_mqtt_line(self):
+        sup = make_supervisor(self.data_dir)
+        self.assertIn("mqtt: disabled", dashboard.render_index(sup))
+        sup.mqtt = SimpleNamespace(
+            enabled=True,
+            status_line=lambda: "mqtt: connected to ha.local:1883",
+            publish=lambda status, sup_info: None,
+        )
+        self.assertIn("mqtt: connected to ha.local:1883",
+                      dashboard.render_index(sup))
+
+
 if __name__ == "__main__":
     unittest.main()
